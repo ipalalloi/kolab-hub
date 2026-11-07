@@ -1,0 +1,17 @@
+{
+  "name": "Kolab-Hub",
+  "short_name": "Kolab",
+  "description": "Kanban kolaborasi yang terhubung dengan WhatsApp",
+  "lang": "id",
+  "start_url": "/#/tugasku",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f5",
+  "theme_color": "#0f5c4c",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Tugas saya", "url": "/#/tugasku" }
+  ]
+}
