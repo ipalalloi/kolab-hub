@@ -32,6 +32,16 @@ async function project(t, cardId) {
   return state;
 }
 
+/**
+ * Kunci baris kartu sampai transaksi selesai lalu kembalikan keadaan terbarunya.
+ * PostgreSQL: SELECT … FOR UPDATE sehingga perubahan bersamaan dari web dan WA berurutan.
+ * SQLite: transaksi BEGIN IMMEDIATE sudah menyerialkan seluruh penulisan.
+ */
+export async function lockCard(t, cardId) {
+  const lock = t.dialect === 'pg' ? ' FOR UPDATE' : '';
+  return t.get(`SELECT * FROM cards WHERE id = ?${lock}`, [cardId]);
+}
+
 /** Tambah event untuk kartu yang sudah ada, lalu hitung ulang proyeksinya. */
 export async function appendCardEvent(t, card, ev) {
   const e = await insertEvent(t, { ...ev, workspace_id: card.workspace_id, card_id: card.id });

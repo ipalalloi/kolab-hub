@@ -4,7 +4,11 @@
 # BACKUP_PASSPHRASE dibaca dari .env; simpan salinannya di pengelola kata sandi, bukan di repo.
 set -eu
 cd "$(dirname "$0")/.."
+# set -a: semua variabel dari .env diekspor, termasuk BACKUP_PASSPHRASE yang dibaca openssl lewat -pass env:
+set -a
 . ./.env
+set +a
+: "${BACKUP_PASSPHRASE:?isi BACKUP_PASSPHRASE di .env}"
 DEST="${BACKUP_DIR:-/var/backups/kolab}"
 KEEP_DAYS="${BACKUP_KEEP_DAYS:-30}"
 mkdir -p "$DEST"

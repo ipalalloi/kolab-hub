@@ -127,7 +127,9 @@ export function registerRoutes(router, ctx) {
         await t.run('UPDATE people SET verified_at = COALESCE(verified_at, ?), consent_at = ?, consent_version = ? WHERE id = ?', [ts, ts, CONSENT_VERSION, p.id]);
       }
       const existing = await t.get('SELECT * FROM memberships WHERE workspace_id = ? AND person_id = ?', [inv.workspace_id, p.id]);
-      if (existing) await t.run('UPDATE memberships SET role = ?, removed_at = NULL WHERE workspace_id = ? AND person_id = ?', [inv.role, inv.workspace_id, p.id]);
+      // Anggota aktif mempertahankan perannya (undangan tidak boleh menurunkan pemilik); hanya anggota yang pernah keluar diaktifkan lagi.
+      if (existing && !existing.removed_at) { /* peran tetap */ }
+      else if (existing) await t.run('UPDATE memberships SET role = ?, removed_at = NULL WHERE workspace_id = ? AND person_id = ?', [inv.role, inv.workspace_id, p.id]);
       else await t.run('INSERT INTO memberships (workspace_id, person_id, role, wip_limit, created_at) VALUES (?, ?, ?, ?, ?)', [inv.workspace_id, p.id, inv.role, cfg.defaultWipLimit, ts]);
       await t.run('UPDATE invites SET used_at = ? WHERE token_hash = ?', [ts, inv.token_hash]);
       await appendWorkspaceEvent(t, inv.workspace_id, { type: 'member.joined', source: client(req), actor_id: p.id, payload: { role: inv.role, consent_version: CONSENT_VERSION } });
@@ -370,14 +372,22 @@ export function registerRoutes(router, ctx) {
     const b = await readJson(req);
     return db.tx(async (t) => {
       const proposer = await t.get('SELECT * FROM people WHERE id = ?', [pr.person_id]);
-      const phone = crypto.decrypt(proposer?.phone_enc);
+      // Kabari pengusul hanya bila ia masih anggota aktif workspace ini.
+      const phone = (await getMembership(t, pr.workspace_id, pr.person_id)) ? crypto.decrypt(proposer?.phone_enc) : null;
       if (decision === 'reject') {
         await t.run("UPDATE proposals SET status = 'ditolak', decided_by = ?, decided_at = ? WHERE id = ?", [p.id, nowIso(), id]);
         if (phone) await outbound.text(t, { phone, person_id: proposer.id, workspace_id: pr.workspace_id, text: `Usulan "${pr.title}" belum dijadikan kartu.${b.note ? ` Catatan: ${b.note}` : ''}` });
         return { ok: true };
       }
       const board = await t.get('SELECT * FROM boards WHERE id = ?', [pr.board_id]);
-      const assignee = b.assignee_id === undefined ? pr.person_id : b.assignee_id;
+      let assignee = b.assignee_id === undefined ? pr.person_id : b.assignee_id;
+      if (assignee) {
+        const am = await getMembership(t, pr.workspace_id, assignee);
+        if (!am || am.role === 'viewer') {
+          if (b.assignee_id !== undefined) throw new HttpError(400, 'Penanggung jawab harus anggota aktif');
+          assignee = null; // pengusul sudah keluar atau hanya pemantau → kartu dibuat tanpa penanggung jawab
+        }
+      }
       const { card } = await createCard(t, { board, title: b.title || pr.title, assignee_id: assignee, actor_id: p.id, source: client(req), extra: { from_proposal: pr.id, proposed_by: pr.person_id } });
       await t.run("UPDATE proposals SET status = 'diterima', card_id = ?, decided_by = ?, decided_at = ? WHERE id = ?", [card.id, p.id, nowIso(), id]);
       if (assignee) await notifyAssignment(t, card, assignee);
@@ -388,14 +398,16 @@ export function registerRoutes(router, ctx) {
 
   router.get('/api/workspaces/:id/review', async (req, { id }) => {
     const p = need(req);
-    const me = await requireRole(db, id, p.id, ['owner', 'coordinator']);
+    await requireRole(db, id, p.id, ['owner', 'coordinator']);
     const cards = await db.all('SELECT * FROM cards WHERE workspace_id = ? AND needs_review = 1 AND deleted_at IS NULL ORDER BY updated_at DESC', [id]);
     const cv = [];
     for (const c of cards) cv.push(await cardView(db, c));
     const msgs = await db.all(
       `SELECT meta_id, status, error, received_at, person_id, body_enc, content_purged_at FROM wa_messages
-       WHERE status IN ('rejected','needs_review','unknown_sender','failed') AND (workspace_id = ? OR (workspace_id IS NULL AND (person_id IN (SELECT person_id FROM memberships WHERE workspace_id = ?) OR ? = 'owner')))
-       ORDER BY received_at DESC LIMIT 100`, [id, id, me.role]);
+       WHERE status IN ('rejected','needs_review','failed')
+         AND (workspace_id = ? OR (workspace_id IS NULL AND person_id IN (SELECT person_id FROM memberships WHERE workspace_id = ? AND removed_at IS NULL)))
+       ORDER BY received_at DESC LIMIT 100`, [id, id]);
+    // Pesan dari nomor asing tidak terkait workspace mana pun, jadi tidak ditampilkan ke pemilik workspace mana pun.
     return {
       cards: cv,
       messages: msgs.map((m) => ({ meta_id: m.meta_id, status: m.status, error: m.error, received_at: m.received_at, text: m.content_purged_at ? '[isi dihapus sesuai retensi]' : crypto.decrypt(m.body_enc) })),

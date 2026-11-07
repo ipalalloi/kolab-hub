@@ -54,16 +54,21 @@ export function makeWebhook(ctx) {
       const since = new Date(Date.now() - 60_000).toISOString();
       const recent = await db.get('SELECT COUNT(*) AS n FROM wa_messages WHERE phone_hash = ? AND received_at > ?', [phoneHash, since]);
       const limited = Number(recent.n) >= cfg.wa.rateLimitPerMinute;
-      const inserted = await db.run(
-        `INSERT INTO wa_messages (meta_id, phone_hash, msg_type, body_enc, media, context_id, status, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (meta_id) DO NOTHING`,
-        [m.meta_id, phoneHash, m.type, crypto.encrypt(m.body), m.media ? JSON.stringify(m.media) : null, m.context_id,
-          limited ? 'rate_limited' : 'received', nowIso()],
-      );
-      if (inserted.changes > 0 && !limited) {
-        await queue.enqueue('wa.process', { meta_id: m.meta_id }, { dedupeKey: `wa:${m.meta_id}` });
-        accepted++;
-      }
+      // Pesan dan tugas prosesnya disimpan dalam satu transaksi: tidak ada pesan "received" tanpa tugas.
+      const queued = await db.tx(async (t) => {
+        const inserted = await t.run(
+          `INSERT INTO wa_messages (meta_id, phone_hash, msg_type, body_enc, media, context_id, status, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (meta_id) DO NOTHING`,
+          [m.meta_id, phoneHash, m.type, crypto.encrypt(m.body), m.media ? JSON.stringify(m.media) : null, m.context_id,
+            limited ? 'rate_limited' : 'received', nowIso()],
+        );
+        if (inserted.changes > 0 && !limited) {
+          await queue.enqueue('wa.process', { meta_id: m.meta_id }, { t, dedupeKey: `wa:${m.meta_id}` });
+          return true;
+        }
+        return false;
+      });
+      if (queued) accepted++;
     }
     for (const s of statuses) {
       if (!s.id || !['delivered', 'read', 'failed'].includes(s.status)) continue;

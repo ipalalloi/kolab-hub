@@ -19,16 +19,19 @@ export function createHandler(ctx) {
   const allowedOrigin = new URL(ctx.cfg.baseUrl).origin;
 
   async function stream(req, res, person) {
-    const ws = (await ctx.db.all('SELECT workspace_id FROM memberships WHERE person_id = ? AND removed_at IS NULL', [person.id])).map((r) => r.workspace_id);
     let cursor = Number(req.headers['last-event-id'] || 0);
     if (!cursor) cursor = Number((await ctx.db.get('SELECT MAX(seq) AS s FROM events'))?.s || 0);
     res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
     res.write('retry: 3000\n\n');
     let closed = false;
     const tick = async () => {
-      if (closed || !ws.length) return;
-      const marks = ws.map(() => '?').join(',');
-      const rows = await ctx.db.all(`SELECT seq, workspace_id, card_id, type, source, payload, created_at FROM events WHERE seq > ? AND workspace_id IN (${marks}) ORDER BY seq LIMIT 200`, [cursor, ...ws]);
+      if (closed) return;
+      // Sesi dan keanggotaan diperiksa ulang tiap putaran: akses yang dicabut langsung menghentikan aliran.
+      if (!(await ctx.auth.sessionPerson(req.sessionToken))) { res.end(); closed = true; return; }
+      const rows = await ctx.db.all(
+        `SELECT e.seq, e.workspace_id, e.card_id, e.type, e.source, e.payload, e.created_at FROM events e
+         JOIN memberships m ON m.workspace_id = e.workspace_id AND m.person_id = ? AND m.removed_at IS NULL
+         WHERE e.seq > ? ORDER BY e.seq LIMIT 200`, [person.id, cursor]);
       for (const r of rows) {
         cursor = Number(r.seq);
         const card = r.card_id ? await ctx.db.get('SELECT code, board_id, column_key FROM cards WHERE id = ?', [r.card_id]) : null;

@@ -1,6 +1,6 @@
 // Aturan transisi kartu dan hak akses. Dipakai bersama oleh web, PWA, dan WhatsApp.
 import { HttpError } from '../lib/util.js';
-import { appendCardEvent } from './store.js';
+import { appendCardEvent, lockCard } from './store.js';
 
 export const MANAGER_ROLES = new Set(['owner', 'coordinator']);
 const COLUMN_KEYS = new Set(['masuk', 'dikerjakan', 'ditinjau', 'selesai', 'tertahan']);
@@ -38,7 +38,10 @@ async function checkWip(t, card, personId) {
  * @param actor {person_id}
  * @param action mulai|progres|selesai|tahan|lanjut|setujui|revisi|pindah|tugaskan|ubah|komentar|bantuan|hapus|cek
  */
-export async function performCardAction(t, { card, actor, action, args = {}, source, wa_message_id }) {
+export async function performCardAction(t, { card: given, actor, action, args = {}, source, wa_message_id }) {
+  // Validasi selalu terhadap keadaan terkunci terbaru, bukan salinan yang dibaca sebelum transaksi.
+  const card = await lockCard(t, given.id);
+  if (!card || card.deleted_at) throw new HttpError(404, 'Kartu tidak ditemukan');
   const m = await requireRole(t, card.workspace_id, actor.person_id);
   const isManager = MANAGER_ROLES.has(m.role);
   const isAssignee = card.assignee_id && card.assignee_id === actor.person_id;
@@ -146,7 +149,7 @@ export async function revertEvent(t, { seq, actor, reason, source }) {
   const ev = await t.get('SELECT * FROM events WHERE seq = ?', [seq]);
   if (!ev || !ev.card_id) throw new HttpError(404, 'Event tidak ditemukan');
   if (['card.created', 'event.reverted'].includes(ev.type)) throw new HttpError(409, 'Event ini tidak dapat dibatalkan');
-  const card = await t.get('SELECT * FROM cards WHERE id = ?', [ev.card_id]);
+  const card = await lockCard(t, ev.card_id);
   await requireRole(t, card.workspace_id, actor.person_id, ['owner', 'coordinator']);
   const already = await t.get("SELECT seq FROM events WHERE card_id = ? AND type = 'event.reverted' AND payload LIKE ?", [card.id, `%"target_seq":${Number(seq)},%`]);
   if (already) throw new HttpError(409, 'Event ini sudah dibatalkan');

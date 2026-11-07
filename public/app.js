@@ -30,7 +30,11 @@ async function api(method, path, body) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && !location.hash.startsWith('#/masuk') && !location.hash.startsWith('#/gabung')) { location.hash = '#/masuk'; throw new Error('Silakan masuk'); }
+  if (res.status === 401) {
+    // Sesi berakhir di server: buang salinan data pribadi agar tidak terbaca luring oleh pengguna berikutnya.
+    await clearPrivateCache();
+    if (!location.hash.startsWith('#/masuk') && !location.hash.startsWith('#/gabung')) { location.hash = '#/masuk'; throw new Error('Silakan masuk'); }
+  }
   if (!res.ok) throw new Error(data.error || `Gagal (${res.status})`);
   return data;
 }
@@ -56,6 +60,20 @@ function connectStream() {
   es.addEventListener('kolab', () => { clearTimeout(connectStream.t); connectStream.t = setTimeout(() => state.rerender?.(), 300); });
   es.onerror = () => {};
   state.stream = es;
+}
+
+/** Hapus salinan respons API pribadi dari cache service worker (cangkang aplikasi tetap). */
+async function clearPrivateCache() {
+  if (!('caches' in window)) return;
+  for (const name of await caches.keys()) {
+    const cache = await caches.open(name);
+    for (const req of await cache.keys()) if (new URL(req.url).pathname.startsWith('/api/')) await cache.delete(req);
+  }
+}
+
+async function endSession() {
+  state.me = null; state.stream?.close(); state.stream = null;
+  await clearPrivateCache();
 }
 
 // ---------- Tampilan ----------
@@ -337,8 +355,8 @@ async function viewAccount(main) {
     h('p', {}, h('b', {}, me.person.name), ` · ${me.person.phone}`),
     h('div', { class: 'row' },
       h('a', { class: 'btn', href: '/api/me/export', download: 'data-saya-kolab-hub.json' }, 'Ekspor data saya'),
-      h('button', { class: 'btn', onclick: run(async () => { await api('POST', '/api/auth/logout'); state.me = null; state.stream?.close(); state.stream = null; location.hash = '#/masuk'; }) }, 'Keluar'),
-      h('button', { class: 'btn danger', onclick: run(async () => { if (!confirm('Hapus akun dan nomor Anda? Riwayat kerja tetap ada atas nama "Mantan anggota".')) return; await api('DELETE', '/api/me'); location.hash = '#/masuk'; location.reload(); }) }, 'Hapus akun'))));
+      h('button', { class: 'btn', onclick: run(async () => { await api('POST', '/api/auth/logout'); await endSession(); location.hash = '#/masuk'; }) }, 'Keluar'),
+      h('button', { class: 'btn danger', onclick: run(async () => { if (!confirm('Hapus akun dan nomor Anda? Riwayat kerja tetap ada atas nama "Mantan anggota".')) return; await api('DELETE', '/api/me'); await endSession(); location.hash = '#/masuk'; location.reload(); }) }, 'Hapus akun'))));
   for (const m of me.memberships) {
     const f = h('form', { class: 'panel row', style: 'margin-top:12px' }, h('b', { class: 'grow' }, `${m.workspace_name} (${m.role})`),
       h('select', { name: 'availability', style: 'max-width:180px' }, ['tersedia', 'sibuk', 'cuti'].map((a) => h('option', { value: a, selected: a === m.availability }, a))),

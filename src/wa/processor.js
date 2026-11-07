@@ -2,7 +2,7 @@
 // yang tidak cocok pola disimpan sebagai komentar "perlu dicek" atau masuk antrean tinjauan.
 import { HttpError, nowIso, parseJson, newId } from '../lib/util.js';
 import { parseMessage, HELP_TEXT } from './parser.js';
-import { performCardAction, getCardByCode, MANAGER_ROLES } from '../domain/actions.js';
+import { performCardAction, getCardByCode, requireRole, MANAGER_ROLES } from '../domain/actions.js';
 import { createCard } from '../domain/store.js';
 
 const COLUMN_LABEL = { masuk: 'Masuk', dikerjakan: 'Dikerjakan', ditinjau: 'Ditinjau', selesai: 'Selesai', tertahan: 'Tertahan' };
@@ -89,13 +89,15 @@ export function makeProcessor(ctx) {
 
   async function handleCard(t, msg, person, card, parsed, media) {
     let { action, args } = parsed;
+    // Kode kartu dicari global; keanggotaan aktif wajib sebelum apa pun tentang kartu dibalas.
+    await requireRole(t, card.workspace_id, person.id);
+    await t.run('UPDATE wa_messages SET workspace_id = ?, card_id = ? WHERE meta_id = ?', [card.workspace_id, card.id, msg.meta_id]);
     if (!action) return { text: `${card.code}: ${card.title} — ${COLUMN_LABEL[card.column_key]} ${card.progress}%\n${link(card.code)}`, card_id: card.id, workspace_id: card.workspace_id };
     if (media) {
       args = { ...args, attachments: [media] };
       if (action === 'komentar') args.text = `${args.text || ''} [lampiran ${media.type}]`.trim();
     }
     const { state } = await performCardAction(t, { card, actor: { person_id: person.id }, action, args, source: 'wa', wa_message_id: msg.meta_id });
-    await t.run('UPDATE wa_messages SET workspace_id = ?, card_id = ? WHERE meta_id = ?', [card.workspace_id, card.id, msg.meta_id]);
     return { text: confirmText(card, state, action), card_id: card.id, workspace_id: card.workspace_id };
   }
 
