@@ -5,7 +5,7 @@ import { openDb } from '../src/db/index.js';
 import { migrate } from '../src/db/migrate.js';
 import { makeContext } from '../src/app.js';
 import { audit } from '../src/domain/store.js';
-import { DEFAULT_TRANSFERS } from '../src/api/routes.js';
+import { insertDefaultTransfers } from '../src/api/routes.js';
 import { newId, nowIso, normalizePhone } from '../src/lib/util.js';
 
 const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : undefined; };
@@ -36,10 +36,8 @@ await db.tx(async (t) => {
   const ws = newId();
   await t.run('INSERT INTO workspaces (id, name, retention_days, created_at) VALUES (?, ?, ?, ?)', [ws, wsName, cfg.retention.defaultDays, ts]);
   await t.run('INSERT INTO memberships (workspace_id, person_id, role, wip_limit, created_at) VALUES (?, ?, ?, ?, ?)', [ws, person.id, 'owner', cfg.defaultWipLimit, ts]);
-  for (const x of DEFAULT_TRANSFERS) {
-    await t.run('INSERT INTO data_transfers (id, workspace_id, purpose, country, recipient, data_categories, instrument, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [newId(), ws, x.purpose, x.country, x.recipient, x.data_categories, x.instrument, ts]);
-  }
+  // Tanggal tinjau diisi sama seperti workspace yang dibuat lewat web (satu tahun).
+  await insertDefaultTransfers(t, ws, ts);
   await audit(t, { workspace_id: ws, actor_id: person.id, action: 'owner.created_by_admin' });
 });
 console.log(`Pemilik dibuat untuk ${phone.slice(0, 4)}****${phone.slice(-3)}. Masuk di ${cfg.baseUrl} dengan nomor tersebut.`);

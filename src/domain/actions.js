@@ -34,6 +34,44 @@ async function checkWip(t, card, personId) {
 }
 
 /**
+ * Ubah isian persentase menjadi bilangan bulat 0–100, atau null bila tidak sah.
+ * Isian kosong, spasi, null, boolean, dan teks bukan angka TIDAK dianggap 0
+ * (Number('') === 0 adalah jebakan yang membuat kartu tercatat 0%).
+ */
+export function parsePercent(v) {
+  if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 100 ? v : null;
+  if (typeof v !== 'string') return null;
+  const s = v.trim().replace(/%$/, '').trim();
+  if (!/^\d{1,3}$/.test(s)) return null;
+  const n = Number(s);
+  return n <= 100 ? n : null;
+}
+
+/**
+ * Tindakan tombol yang tersedia untuk seseorang pada kartu dalam keadaannya sekarang.
+ * Cerminan aturan performCardAction (diuji silang di test/ui-actions.test.js) supaya
+ * antarmuka tidak menampilkan tombol yang pasti ditolak server.
+ * Batas WIP tidak dihitung di sini; itu diperiksa saat tindakan dijalankan.
+ */
+export function allowedActions(card, membership, personId) {
+  if (!card || card.deleted_at || !membership || membership.role === 'viewer') return [];
+  const out = [];
+  const col = card.column_key;
+  const isManager = MANAGER_ROLES.has(membership.role);
+  const isWorker = isManager || (card.assignee_id && card.assignee_id === personId);
+  if (isWorker && col !== 'selesai') {
+    if (col === 'masuk' || col === 'tertahan') out.push('mulai');
+    if (col !== 'ditinjau') out.push('progres', 'selesai');
+    if (col !== 'tertahan') out.push('tahan');
+    out.push('bantuan');
+  }
+  if (isManager && col === 'ditinjau') out.push('setujui', 'revisi');
+  if (isManager && Number(card.needs_review)) out.push('cek');
+  out.push('komentar');
+  return out;
+}
+
+/**
  * Jalankan satu tindakan pada kartu.
  * @param actor {person_id}
  * @param action mulai|progres|selesai|tahan|lanjut|setujui|revisi|pindah|tugaskan|ubah|komentar|bantuan|hapus|cek
@@ -66,8 +104,8 @@ export async function performCardAction(t, { card: given, actor, action, args = 
     case 'progres': {
       ensureWorker(); doneOrClosed();
       if (col === 'ditinjau') throw new HttpError(409, `Kartu ${card.code} sedang ditinjau koordinator`, 'in_review');
-      const percent = Number(args.percent);
-      if (!Number.isFinite(percent) || percent < 0 || percent > 100) throw new HttpError(400, 'Persentase progres harus 0–100', 'bad_percent');
+      const percent = parsePercent(args.percent);
+      if (percent === null) throw new HttpError(400, 'Persentase progres wajib diisi dengan angka bulat 0–100', 'bad_percent');
       if (col !== 'dikerjakan') await checkWip(t, card, workerId);
       return appendCardEvent(t, card, { ...base, type: 'card.progress', payload: { percent, note: args.note || '' } });
     }
@@ -78,6 +116,7 @@ export async function performCardAction(t, { card: given, actor, action, args = 
     }
     case 'tahan': {
       ensureWorker(); doneOrClosed();
+      if (col === 'tertahan') throw new HttpError(409, `Kartu ${card.code} sudah tertahan`, 'noop');
       const reason = String(args.reason || '').trim();
       if (!reason) throw new HttpError(400, 'Alasan wajib diisi: #KODE tahan <alasan>', 'reason_required');
       return appendCardEvent(t, card, { ...base, type: 'card.held', payload: { reason } });
@@ -128,11 +167,12 @@ export async function performCardAction(t, { card: given, actor, action, args = 
       return appendCardEvent(t, card, { ...base, type: 'card.commented', payload: { text: text.slice(0, 4000), needs_review: !!args.needs_review } });
     }
     case 'bantuan': {
-      ensureWorker();
+      ensureWorker(); doneOrClosed();
       return appendCardEvent(t, card, { ...base, type: 'card.help_requested', payload: { note: String(args.note || '').slice(0, 1000) } });
     }
     case 'cek': {
       ensureManager();
+      if (!Number(card.needs_review)) throw new HttpError(409, `Kartu ${card.code} tidak sedang ditandai perlu dicek`, 'noop');
       return appendCardEvent(t, card, { ...base, type: 'card.review_cleared', payload: {} });
     }
     case 'hapus': {
