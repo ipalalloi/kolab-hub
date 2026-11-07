@@ -193,3 +193,18 @@ test('hapus akun mencabut semua langganan push; ekspor data memuat perangkat pus
     assert.equal(Number((await ctx.db.get('SELECT COUNT(*) AS n FROM push_subscriptions WHERE person_id = ?', [s.budi.id])).n), 0);
   } finally { server.close(); }
 });
+
+test('VAPID: kunci privat P-256 dengan nol di depan (31 byte) tetap sah dan dinormalkan ke 32 byte', async () => {
+  const { createECDH } = await import('node:crypto');
+  // Cari kunci yang skalar privatnya diawali 0x00 (≈1/256), seperti hasil getPrivateKey() apa adanya.
+  let ecdh;
+  for (let i = 0; i < 20000; i++) { ecdh = createECDH('prime256v1'); ecdh.generateKeys(); if (ecdh.getPrivateKey().length < 32) break; }
+  assert.ok(ecdh.getPrivateKey().length < 32, 'kunci pendek ditemukan');
+  const legacy = { publicKey: b64u.enc(ecdh.getPublicKey()), privateKey: b64u.enc(ecdh.getPrivateKey()), subject: 'mailto:a@b.id' };
+  // Kunci lama (31 byte) dari .env yang sudah ada tetap bekerja.
+  const claims = verifyVapidAuthorization(vapidAuthorization('https://push.contoh.test/x', legacy));
+  assert.equal(claims.aud, 'https://push.contoh.test');
+  await setup({ VAPID_PUBLIC_KEY: legacy.publicKey, VAPID_PRIVATE_KEY: legacy.privateKey, VAPID_SUBJECT: legacy.subject });
+  // Kunci baru selalu 32 byte.
+  for (let i = 0; i < 2000; i++) assert.equal(b64u.dec(generateVapidKeys().privateKey).length, 32);
+});
