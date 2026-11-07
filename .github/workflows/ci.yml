@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: npm test (Node ${{ matrix.node }}) + migrasi PostgreSQL
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kolab
+          POSTGRES_PASSWORD: kolab_ci_only
+          POSTGRES_DB: kolab_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U kolab"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Basis data sekali pakai milik job CI; bukan kredensial produksi.
+      PG_TEST_URL: postgres://kolab:kolab_ci_only@localhost:5432/kolab_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Pasang dependensi (termasuk pg opsional)
+        run: npm install --no-audit --no-fund
+      - name: Pastikan pg terpasang
+        run: node -e "import('pg').then(() => console.log('pg ok'))"
+      - name: Uji
+        run: npm test
+      - name: Migrasi lewat skrip produksi (npm run migrate)
+        env:
+          DATABASE_URL: ${{ env.PG_TEST_URL }}
+        run: npm run migrate
