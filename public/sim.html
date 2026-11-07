@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Simulator WhatsApp — Kolab-Hub</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar"><a href="/#/" class="brand"><img src="/icon.svg" alt="" width="28" height="28"> Simulator WA</a><span class="muted">Hanya aktif bila WA_MODE=simulate</span></header>
+  <main>
+    <div class="grid2">
+      <form id="send" class="panel stack">
+        <h1>Kirim pesan sebagai kolaborator</h1>
+        <p class="muted">Pesan dikirim ke webhook yang sama dengan Meta (ditandatangani HMAC), lalu diproses worker.</p>
+        <div><label for="phone">Nomor pengirim</label><input id="phone" name="phone" value="6281200000003" inputmode="tel"></div>
+        <div><label for="text">Pesan</label><textarea id="text" name="text" placeholder="#DIS-0001 mulai"></textarea></div>
+        <div class="row">
+          <div class="grow"><label for="ctx">Balas (quote) pesan id — opsional</label><input id="ctx" name="ctx" placeholder="sim.xxxx"></div>
+          <div><label for="media">Lampiran</label><select id="media" name="media"><option value="">—</option><option value="image">foto</option><option value="document">dokumen</option></select></div>
+        </div>
+        <div class="row" id="presets"></div>
+        <button class="btn primary">Kirim</button>
+      </form>
+      <section class="panel">
+        <div class="row"><h1 class="grow">Pesan keluar</h1><button class="btn small" id="refresh">Muat ulang</button></div>
+        <p class="muted">Klik "balas" untuk memakai pesan sebagai konteks quote.</p>
+        <ul id="outbox" class="history"></ul>
+      </section>
+    </div>
+  </main>
+  <div id="toast" role="status" hidden></div>
+  <script type="module" src="/sim.js"></script>
+</body>
+</html>

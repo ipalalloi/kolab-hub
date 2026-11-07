@@ -56,10 +56,12 @@ export async function openPg(url) {
   try { pg = (await import('pg')).default; }
   catch { throw new Error('Paket "pg" belum terpasang. Jalankan `npm install` di VPS (butuh akses internet).'); }
   const pool = new pg.Pool({ connectionString: url, max: 10 });
+  // Tanpa parameter → protokol query sederhana (mengizinkan banyak pernyataan, mis. migrasi).
+  const query = (q, sql, params) => (params.length ? q.query(pgSql(sql), params.map(toParam)) : q.query(sql));
   const wrap = (q) => ({
-    async all(sql, params = []) { return (await q.query(pgSql(sql), params.map(toParam))).rows; },
-    async get(sql, params = []) { return (await q.query(pgSql(sql), params.map(toParam))).rows[0] ?? null; },
-    async run(sql, params = []) { const r = await q.query(pgSql(sql), params.map(toParam)); return { changes: r.rowCount, rows: r.rows }; },
+    async all(sql, params = []) { return (await query(q, sql, params)).rows; },
+    async get(sql, params = []) { return (await query(q, sql, params)).rows[0] ?? null; },
+    async run(sql, params = []) { const r = await query(q, sql, params); return { changes: r.rowCount ?? 0, rows: r.rows || [] }; },
   });
   return {
     dialect: 'pg',

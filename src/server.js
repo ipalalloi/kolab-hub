@@ -78,6 +78,7 @@ export function createHandler(ctx) {
         if (ctx.cfg.workerInline && req.method !== 'GET') ctx.worker.drain().catch((e) => ctx.log.error?.(e));
         return send(res, 200, out ?? { ok: true });
       }
+      if ((path === '/sim.html' || path === '/sim.js') && ctx.cfg.wa.mode !== 'simulate') return send(res, 404, 'tidak ditemukan');
       if (req.method === 'GET' && (await serveStatic(res, PUBLIC_DIR, path))) return;
       if (req.method === 'GET' && path === '/sim' && ctx.cfg.wa.mode === 'simulate' && (await serveStatic(res, PUBLIC_DIR, '/sim.html'))) return;
       return send(res, 404, 'tidak ditemukan');

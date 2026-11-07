@@ -1,0 +1,28 @@
+{$DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+	# SSE butuh tanpa buffer
+	reverse_proxy app:3000 {
+		flush_interval -1
+	}
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep_for 720h
+		}
+		# Jangan catat query string (bisa berisi hub.verify_token)
+		format filter {
+			wrap console
+			fields {
+				request>uri query {
+					delete hub.verify_token
+					delete hub.challenge
+				}
+				request>headers>Cookie delete
+			}
+		}
+	}
+}
