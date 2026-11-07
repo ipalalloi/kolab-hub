@@ -5,6 +5,7 @@ import { readJson } from '../http/http.js';
 import { performCardAction, revertEvent, requireRole, getCardByCode, getMembership, allowedActions, MANAGER_ROLES } from '../domain/actions.js';
 import { createCard, audit, defaultColumns, rowToEvent, appendWorkspaceEvent } from '../domain/store.js';
 import { runRetention } from '../jobs/retention.js';
+import { registerReports } from './reports.js';
 
 export const CONSENT_VERSION = 'privasi-2026-11-07';
 const ROLES = ['owner', 'coordinator', 'collaborator', 'viewer'];
@@ -541,6 +542,9 @@ export function registerRoutes(router, ctx) {
     await audit(db, { workspace_id: id, actor_id: p.id, action: 'retention.manual_run', detail: r, ip: req.ip });
     return r;
   });
+
+  // ---------- Dasbor beban kerja dan ekspor (Fase 2) ----------
+  registerReports(router, ctx, { need });
 
   // ---------- Simulasi WA (hanya WA_MODE=simulate) ----------
   if (cfg.wa.mode === 'simulate') {

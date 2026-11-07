@@ -51,7 +51,7 @@ function nav() {
   n.replaceChildren();
   if (!state.me) return;
   const links = [['#/tugasku', 'Tugas saya'], ['#/', 'Proyek']];
-  if (isManager()) links.push([`#/tinjauan`, 'Tinjauan']);
+  if (isManager()) links.push([`#/tinjauan`, 'Tinjauan'], ['#/beban', 'Beban kerja']);
   links.push(['#/akun', 'Akun']);
   for (const [href, label] of links) n.append(h('a', { href, class: location.hash === href || (href === '#/' && location.hash.startsWith('#/papan')) ? 'active' : '' }, label));
 }
@@ -139,7 +139,16 @@ async function enablePush() {
   let sub = await reg.pushManager.getSubscription();
   // Kunci server diganti: langganan lama tidak bisa dipakai lagi.
   if (sub && sub.options?.applicationServerKey && bytesToB64u(sub.options.applicationServerKey) !== key.public_key) { await sub.unsubscribe(); sub = null; }
-  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key.public_key) });
+  if (!sub) {
+    toast('Mengaktifkan notifikasi…');
+    // subscribe() dapat menggantung bila layanan push peramban tidak terjangkau; beri batas waktu.
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error('timeout'), { name: 'AbortError' })), 20_000));
+    try { sub = await Promise.race([reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key.public_key) }), timeout]); }
+    catch (e) {
+      // Pesan peramban sering teknis (mis. mode penyamaran, layanan push tak terjangkau).
+      throw new Error(`Peramban tidak dapat mengaktifkan notifikasi di perangkat ini${e?.name === 'AbortError' ? ' (layanan push tidak terjangkau)' : ''}. Coba di jendela biasa (bukan penyamaran) atau dari aplikasi yang sudah dipasang. Tugas tetap diberitahukan lewat WhatsApp.`);
+    }
+  }
   await api('POST', '/api/push/subscribe', { subscription: sub.toJSON(), device: deviceLabel() });
 }
 
@@ -588,6 +597,60 @@ async function viewAccount(main) {
   if ('serviceWorker' in navigator && !isStandalone) main.append(h('p', { class: 'muted', style: 'margin-top:16px' }, 'Pasang Kolab-Hub ke layar utama dari menu browser agar bisa dibuka seperti aplikasi.'));
 }
 
+// ---------- Dasbor beban kerja dan ekspor ----------
+async function viewWorkload(main, arg) {
+  if (!isManager()) { main.append(h('p', { class: 'panel' }, 'Halaman ini untuk pemilik dan koordinator.')); return; }
+  const days = [7, 30, 90].includes(Number(arg)) ? Number(arg) : 30;
+  const ws = state.ws;
+  const [w, boards] = await Promise.all([api('GET', `/api/workspaces/${ws}/workload?hari=${days}`), api('GET', `/api/workspaces/${ws}/boards`)]);
+  const wsName = state.me.memberships.find((m) => m.workspace_id === ws)?.workspace_name || '';
+  const maxActive = Math.max(1, ...w.members.map((m) => m.aktif), w.unassigned.aktif);
+  const bar = (m) => h('div', { class: 'bar', title: `Masuk ${m.masuk} · Dikerjakan ${m.dikerjakan} · Ditinjau ${m.ditinjau} · Tertahan ${m.tertahan}` },
+    [['b-masuk', m.masuk], ['b-kerja', m.dikerjakan], ['b-tinjau', m.ditinjau], ['b-tahan', m.tertahan]].map(([cls, n]) => (n ? h('span', { class: cls, style: `width:${(n / maxActive) * 100}%` }) : null)));
+  const num = (n, warn) => h('td', { class: warn && n ? 'over' : '' }, String(n));
+  main.append(
+    h('div', { class: 'row' }, h('h1', { class: 'grow' }, `Beban kerja · ${wsName}`),
+      h('label', { for: 'periode' }, 'Periode '),
+      (() => { const sel = h('select', { id: 'periode', style: 'max-width:160px' }, [7, 30, 90].map((d) => h('option', { value: d, selected: d === days }, `${d} hari terakhir`))); sel.addEventListener('change', () => { location.hash = `#/beban/${sel.value}`; }); return sel; })()),
+    h('p', { class: 'muted' }, `Per ${w.today}. "Selesai" = kartu yang disetujui dalam periode, dihitung untuk penanggung jawab saat ini.`),
+    h('div', { class: 'legend' }, [['b-masuk', 'Masuk'], ['b-kerja', 'Dikerjakan'], ['b-tinjau', 'Ditinjau'], ['b-tahan', 'Tertahan']].map(([c, l]) => h('span', {}, h('i', { class: `bar-key ${c}` }), l))),
+    h('div', { class: 'panel table-scroll', style: 'margin-top:8px' }, h('table', { id: 'workload' },
+      h('thead', {}, h('tr', {}, ['Anggota', 'Status', 'WIP', 'Kartu aktif', 'Terlambat', 'Tenggat ≤7 hari', `Selesai ${days} hari`, 'Median hari'].map((x) => h('th', {}, x)))),
+      h('tbody', {},
+        w.members.map((m) => h('tr', {},
+          h('td', {}, h('b', {}, m.name), h('div', { class: 'muted' }, m.role)),
+          h('td', {}, m.availability),
+          h('td', { class: m.melebihi_wip ? 'over' : '' }, `${m.dikerjakan}/${m.wip_limit}`),
+          h('td', {}, h('div', { class: 'bars' }, bar(m), h('span', { class: 'muted' }, `${m.aktif} kartu`))),
+          num(m.terlambat, true), num(m.tenggat_7_hari), num(m.selesai_periode), h('td', {}, m.median_hari_selesai ?? '–'))),
+        h('tr', {}, h('td', {}, h('i', {}, 'Belum ditugaskan')), h('td', {}), h('td', {}), h('td', {}, h('div', { class: 'bars' }, bar(w.unassigned), h('span', { class: 'muted' }, `${w.unassigned.aktif} kartu`))),
+          num(w.unassigned.terlambat, true), num(w.unassigned.tenggat_7_hari), h('td', {}), h('td', {}))))));
+
+  // Ekspor CSV: unduhan biasa (GET) dengan sesi; setiap ekspor tercatat di audit log.
+  const today = w.today;
+  const monthAgo = new Date(Date.parse(today) - 29 * 86_400_000).toISOString().slice(0, 10);
+  const f = h('form', { class: 'panel stack', id: 'exportForm', style: 'margin-top:16px' }, h('h2', { style: 'margin:0' }, 'Ekspor laporan (CSV)'),
+    h('div', { class: 'row' },
+      h('label', {}, 'Proyek ', h('select', { name: 'proyek' }, h('option', { value: '' }, 'Semua proyek'), boards.map((b) => h('option', { value: b.id }, `${b.prefix} · ${b.name}`)))),
+      h('label', {}, 'Status ', h('select', { name: 'status' }, h('option', { value: '' }, 'Semua'), COLS.map(([k, l]) => h('option', { value: k }, l)))),
+      h('label', {}, 'Pemisah ', h('select', { name: 'pemisah' }, h('option', { value: '' }, 'Koma (,)'), h('option', { value: 'titik-koma' }, 'Titik koma (;) — Excel Indonesia')))),
+    h('div', { class: 'row' }, h('label', {}, 'Riwayat dari ', h('input', { type: 'date', name: 'dari', value: monthAgo })), h('label', {}, ' sampai ', h('input', { type: 'date', name: 'sampai', value: today }))),
+    h('div', { class: 'row', id: 'exportLinks' }));
+  const links = f.querySelector('#exportLinks');
+  const qs = (o) => new URLSearchParams(Object.entries(o).filter(([, v]) => v)).toString();
+  const refresh = () => {
+    const sep = f.pemisah.value;
+    links.replaceChildren(
+      h('a', { class: 'btn', 'data-export': 'cards', href: `/api/workspaces/${ws}/export/cards.csv?${qs({ proyek: f.proyek.value, status: f.status.value, pemisah: sep })}`, download: '' }, 'Unduh daftar kartu'),
+      h('a', { class: 'btn', 'data-export': 'events', href: `/api/workspaces/${ws}/export/events.csv?${qs({ dari: f.dari.value, sampai: f.sampai.value, pemisah: sep })}`, download: '' }, 'Unduh riwayat kejadian'),
+      h('a', { class: 'btn', 'data-export': 'workload', href: `/api/workspaces/${ws}/export/workload.csv?${qs({ hari: days, pemisah: sep })}`, download: '' }, 'Unduh beban kerja'));
+  };
+  f.addEventListener('change', () => { state.dirty = false; refresh(); });
+  f.addEventListener('submit', (e) => e.preventDefault());
+  refresh();
+  main.append(f);
+}
+
 // ---------- Router ----------
 async function loadMe() {
   try { state.me = await api('GET', '/api/me'); } catch { state.me = null; }
@@ -610,6 +673,7 @@ async function render() {
     else if (route === 'papan') await viewBoard(fresh, arg);
     else if (route === 'kartu') await viewCard(fresh, decodeURIComponent(arg));
     else if (route === 'tinjauan') await viewReview(fresh);
+    else if (route === 'beban') await viewWorkload(fresh, arg);
     else if (route === 'akun') await viewAccount(fresh);
     else await viewHome(fresh);
   } catch (e) { fresh.append(h('p', { class: 'panel' }, e.message)); }
