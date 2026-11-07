@@ -15,7 +15,7 @@ export async function runRetention(ctx, { now = Date.now() } = {}) {
       [ts, w.id, cutoff],
     );
     const r2 = await db.run(
-      'UPDATE wa_outbox SET body_enc = NULL, content_purged_at = ? WHERE workspace_id = ? AND content_purged_at IS NULL AND created_at < ?',
+      'UPDATE wa_outbox SET body_enc = NULL, template = NULL, content_purged_at = ? WHERE workspace_id = ? AND content_purged_at IS NULL AND created_at < ?',
       [ts, w.id, cutoff],
     );
     purged += r1.changes + r2.changes;
@@ -23,7 +23,7 @@ export async function runRetention(ctx, { now = Date.now() } = {}) {
   // Pesan tanpa workspace (nomor asing, pesan yang ditolak sebelum kartu dikenali) memakai masa bawaan.
   const defCutoff = daysAgo(cfg.retention.defaultDays, now);
   purged += (await db.run('UPDATE wa_messages SET body_enc = NULL, media = NULL, content_purged_at = ? WHERE workspace_id IS NULL AND content_purged_at IS NULL AND received_at < ?', [ts, defCutoff])).changes;
-  purged += (await db.run('UPDATE wa_outbox SET body_enc = NULL, content_purged_at = ? WHERE workspace_id IS NULL AND content_purged_at IS NULL AND created_at < ?', [ts, defCutoff])).changes;
+  purged += (await db.run('UPDATE wa_outbox SET body_enc = NULL, template = NULL, content_purged_at = ? WHERE workspace_id IS NULL AND content_purged_at IS NULL AND created_at < ?', [ts, defCutoff])).changes;
   // Nomor tujuan di outbox hanya diperlukan sampai terkirim.
   await db.run("UPDATE wa_outbox SET to_enc = NULL WHERE status IN ('sent','delivered','read','failed') AND created_at < ?", [daysAgo(7, now)]);
   await db.run('DELETE FROM otp_codes WHERE expires_at < ?', [daysAgo(1, now)]);

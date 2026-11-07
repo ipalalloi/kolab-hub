@@ -116,8 +116,11 @@ export function registerRoutes(router, ctx) {
     if (!name) throw new HttpError(400, 'Nama wajib diisi');
     const { phone, phoneHash } = await auth.verifyOtp(b.phone, b.code, 'join');
     const person = await db.tx(async (t) => {
-      let p = await t.get('SELECT * FROM people WHERE phone_hash = ?', [phoneHash]);
       const ts = nowIso();
+      // Klaim undangan secara atomik sebelum memberi keanggotaan: satu undangan = satu orang.
+      const claimed = await t.run('UPDATE invites SET used_at = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?', [ts, inv.token_hash, ts]);
+      if (claimed.changes === 0) throw new HttpError(404, 'Undangan tidak berlaku atau sudah dipakai');
+      let p = await t.get('SELECT * FROM people WHERE phone_hash = ?', [phoneHash]);
       if (!p) {
         const id = newId();
         await t.run('INSERT INTO people (id, name, phone_enc, phone_hash, verified_at, consent_at, consent_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -131,7 +134,6 @@ export function registerRoutes(router, ctx) {
       if (existing && !existing.removed_at) { /* peran tetap */ }
       else if (existing) await t.run('UPDATE memberships SET role = ?, removed_at = NULL WHERE workspace_id = ? AND person_id = ?', [inv.role, inv.workspace_id, p.id]);
       else await t.run('INSERT INTO memberships (workspace_id, person_id, role, wip_limit, created_at) VALUES (?, ?, ?, ?, ?)', [inv.workspace_id, p.id, inv.role, cfg.defaultWipLimit, ts]);
-      await t.run('UPDATE invites SET used_at = ? WHERE token_hash = ?', [ts, inv.token_hash]);
       await appendWorkspaceEvent(t, inv.workspace_id, { type: 'member.joined', source: client(req), actor_id: p.id, payload: { role: inv.role, consent_version: CONSENT_VERSION } });
       await audit(t, { workspace_id: inv.workspace_id, actor_id: p.id, action: 'member.joined', detail: { role: inv.role, consent_version: CONSENT_VERSION }, ip: req.ip });
       return p;
@@ -371,11 +373,14 @@ export function registerRoutes(router, ctx) {
     await requireRole(db, pr.workspace_id, p.id, ['owner', 'coordinator']);
     const b = await readJson(req);
     return db.tx(async (t) => {
+      // Klaim keputusan secara atomik: hanya satu koordinator yang bisa memutuskan usulan ini.
+      const claimed = await t.run("UPDATE proposals SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'baru'",
+        [decision === 'reject' ? 'ditolak' : 'diterima', p.id, nowIso(), id]);
+      if (claimed.changes === 0) throw new HttpError(409, 'Usulan sudah diputuskan koordinator lain');
       const proposer = await t.get('SELECT * FROM people WHERE id = ?', [pr.person_id]);
       // Kabari pengusul hanya bila ia masih anggota aktif workspace ini.
       const phone = (await getMembership(t, pr.workspace_id, pr.person_id)) ? crypto.decrypt(proposer?.phone_enc) : null;
       if (decision === 'reject') {
-        await t.run("UPDATE proposals SET status = 'ditolak', decided_by = ?, decided_at = ? WHERE id = ?", [p.id, nowIso(), id]);
         if (phone) await outbound.text(t, { phone, person_id: proposer.id, workspace_id: pr.workspace_id, text: `Usulan "${pr.title}" belum dijadikan kartu.${b.note ? ` Catatan: ${b.note}` : ''}` });
         return { ok: true };
       }
@@ -389,7 +394,7 @@ export function registerRoutes(router, ctx) {
         }
       }
       const { card } = await createCard(t, { board, title: b.title || pr.title, assignee_id: assignee, actor_id: p.id, source: client(req), extra: { from_proposal: pr.id, proposed_by: pr.person_id } });
-      await t.run("UPDATE proposals SET status = 'diterima', card_id = ?, decided_by = ?, decided_at = ? WHERE id = ?", [card.id, p.id, nowIso(), id]);
+      await t.run('UPDATE proposals SET card_id = ? WHERE id = ?', [card.id, id]);
       if (assignee) await notifyAssignment(t, card, assignee);
       else if (phone) await outbound.text(t, { phone, person_id: proposer.id, workspace_id: pr.workspace_id, card_id: card.id, text: `Usulan Anda dijadikan kartu ${card.code}.` });
       return { ok: true, code: card.code };
@@ -439,7 +444,7 @@ export function registerRoutes(router, ctx) {
         if (!other) throw new HttpError(409, 'Serahkan peran pemilik ke anggota lain sebelum menghapus akun');
       }
       await t.run('UPDATE wa_messages SET body_enc = NULL, media = NULL, content_purged_at = ? WHERE phone_hash = ? AND content_purged_at IS NULL', [ts, p.phone_hash]);
-      await t.run('UPDATE wa_outbox SET body_enc = NULL, to_enc = NULL, content_purged_at = ? WHERE phone_hash = ?', [ts, p.phone_hash]);
+      await t.run('UPDATE wa_outbox SET body_enc = NULL, to_enc = NULL, template = NULL, content_purged_at = ? WHERE phone_hash = ?', [ts, p.phone_hash]);
       await t.run("UPDATE people SET name = 'Mantan anggota', phone_enc = NULL, phone_hash = NULL, erased_at = ? WHERE id = ?", [ts, p.id]);
       await t.run('UPDATE memberships SET removed_at = ? WHERE person_id = ? AND removed_at IS NULL', [ts, p.id]);
       await t.run('DELETE FROM sessions WHERE person_id = ?', [p.id]);

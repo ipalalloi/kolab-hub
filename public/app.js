@@ -57,10 +57,43 @@ function nav() {
 function connectStream() {
   if (state.stream || !state.me) return;
   const es = new EventSource('/api/stream');
-  es.addEventListener('kolab', () => { clearTimeout(connectStream.t); connectStream.t = setTimeout(() => state.rerender?.(), 300); });
+  es.addEventListener('kolab', (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data); } catch {}
+    if (!eventConcernsView(data)) return;
+    clearTimeout(connectStream.t);
+    connectStream.t = setTimeout(softRefresh, 300);
+  });
   es.onerror = () => {};
   state.stream = es;
 }
+
+/** Hanya event yang menyangkut tampilan saat ini yang memicu penyegaran. */
+function eventConcernsView(data) {
+  const [, route, arg] = (location.hash || '#/tugasku').split('/');
+  if (route === 'kartu') return data.card?.code === decodeURIComponent(arg || '');
+  if (route === 'papan') return data.card?.board_id === arg;
+  if (route === 'akun' || route === 'masuk' || route === 'gabung') return false;
+  return true; // tugasku, tinjauan, beranda: ringkasan lintas kartu
+}
+
+/** Isian yang sedang diketik tidak boleh hilang karena pembaruan dari orang lain. */
+function hasDraft() {
+  const a = document.activeElement;
+  const typing = a && a.closest?.('#app') && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName);
+  return state.dirty || typing;
+}
+
+function softRefresh() {
+  if (!hasDraft()) { state.rerender?.(); return; }
+  const bar = document.getElementById('updates');
+  bar.hidden = false;
+}
+
+document.addEventListener('input', (e) => { if (e.target.closest?.('#app')) state.dirty = true; });
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'updatesReload') { document.getElementById('updates').hidden = true; state.dirty = false; state.rerender?.(); }
+});
 
 /** Hapus salinan respons API pribadi dari cache service worker (cangkang aplikasi tetap). */
 async function clearPrivateCache() {
@@ -401,6 +434,8 @@ async function render() {
     else await viewHome(fresh);
   } catch (e) { fresh.append(h('p', { class: 'panel' }, e.message)); }
   main.replaceChildren(fresh);
+  state.dirty = false;
+  document.getElementById('updates').hidden = true;
   nav();
   connectStream();
 }

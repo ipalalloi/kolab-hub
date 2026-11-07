@@ -12,7 +12,8 @@ export function makeOutbound(ctx) {
       `INSERT INTO wa_outbox (id, person_id, phone_hash, to_enc, workspace_id, card_id, kind, body_enc, template, status, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
       [id, person_id || null, crypto.blindIndex(phone), crypto.encrypt(phone), workspace_id || null, card_id || null, kind,
-        crypto.encrypt(text), template ? JSON.stringify(template) : null, nowIso()],
+        // Parameter template (kode OTP, judul kartu) dienkripsi seperti isi pesan.
+        crypto.encrypt(text), template ? crypto.encrypt(JSON.stringify(template)) : null, nowIso()],
     );
     await queue.enqueue('wa.send', { outbox_id: id }, { t, dedupeKey: `send:${id}` });
     return id;
@@ -34,7 +35,8 @@ export function makeOutbound(ctx) {
       if (cfg.wa.mode === 'simulate') {
         providerId = `sim.${row.id}`;
       } else {
-        const tpl = parseJson(row.template);
+        const tpl = parseJson(crypto.decrypt(row.template));
+        if (row.kind === 'template' && !tpl) throw new Error('parameter template sudah dihapus');
         const body = row.kind === 'template'
           ? { messaging_product: 'whatsapp', to, type: 'template', template: { name: tpl.name, language: { code: cfg.wa.templateLang }, components: tpl.components || [] } }
           : { messaging_product: 'whatsapp', to, type: 'text', text: { preview_url: true, body: text } };

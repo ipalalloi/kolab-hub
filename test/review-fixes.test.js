@@ -141,3 +141,70 @@ test('aliran SSE berhenti mengirim event setelah anggota dikeluarkan', async () 
     assert.doesNotMatch(text, /rahasia setelah dikeluarkan/);
   } finally { ac.abort(); server.close(); }
 });
+
+test('usulan yang sudah diputuskan tidak bisa diputuskan lagi walau pengecekan awal membaca data basi', async () => {
+  const ctx = await setup();
+  const s = await seedBasic(ctx);
+  await sendWa(ctx, s.budi.phone, '#baru DIS Usulan rebutan');
+  const stale = await ctx.db.get('SELECT * FROM proposals');
+  const { server, base } = await serve(ctx);
+  try {
+    const first = await call(base, await sessionFor(ctx, s.coord.id), 'POST', `/api/proposals/${stale.id}/accept`, {});
+    assert.equal(first.status, 200);
+    // Simulasikan koordinator kedua yang lolos pengecekan awal sebelum keputusan pertama tersimpan.
+    const realGet = ctx.db.get;
+    ctx.db.get = (sql, params) => (/FROM proposals WHERE id = \? AND status = 'baru'/.test(sql) ? Promise.resolve(stale) : realGet(sql, params));
+    const second = await call(base, await sessionFor(ctx, s.owner.id), 'POST', `/api/proposals/${stale.id}/accept`, {});
+    const third = await call(base, await sessionFor(ctx, s.owner.id), 'POST', `/api/proposals/${stale.id}/reject`, {});
+    ctx.db.get = realGet;
+    assert.equal(second.status, 409);
+    assert.equal(third.status, 409);
+    const n = await ctx.db.get("SELECT COUNT(*) AS n FROM events WHERE type = 'card.created' AND payload LIKE '%from_proposal%'");
+    assert.equal(Number(n.n), 1, 'tepat satu kartu');
+    assert.equal((await ctx.db.get('SELECT status FROM proposals WHERE id = ?', [stale.id])).status, 'diterima');
+  } finally { server.close(); }
+});
+
+test('satu undangan dipakai dua orang bersamaan → hanya satu yang jadi anggota', async () => {
+  const ctx = await setup();
+  const s = await seedBasic(ctx);
+  const { server, base } = await serve(ctx);
+  try {
+    const inv = await call(base, await sessionFor(ctx, s.owner.id), 'POST', `/api/workspaces/${s.ws}/invites`, { role: 'coordinator' });
+    const phones = ['6281100000701', '6281100000702'];
+    const codes = [];
+    for (const ph of phones) {
+      await call(base, { cookie: '' }, 'POST', `/api/join/${inv.data.token}/otp`, { phone: ph });
+      await ctx.worker.drain();
+      codes.push((await lastReply(ctx, ph)).text.match(/(\d{6})/)[1]);
+    }
+    const join = (i) => call(base, { cookie: '' }, 'POST', `/api/join/${inv.data.token}`, { name: `Calon ${i}`, phone: phones[i], code: codes[i], consent: true });
+    const staleInvite = await ctx.db.get('SELECT i.*, w.name AS workspace_name FROM invites i JOIN workspaces w ON w.id = i.workspace_id');
+    assert.equal((await join(0)).status, 200);
+    // Orang kedua lolos pengecekan awal dengan data undangan basi (belum terpakai).
+    const realGet = ctx.db.get;
+    ctx.db.get = (sql, params) => (/FROM invites i JOIN workspaces/.test(sql) ? Promise.resolve(staleInvite) : realGet(sql, params));
+    const second = await join(1);
+    ctx.db.get = realGet;
+    assert.equal(second.status, 404);
+    const coords = await ctx.db.get("SELECT COUNT(*) AS n FROM memberships WHERE workspace_id = ? AND role = 'coordinator'", [s.ws]);
+    assert.equal(Number(coords.n), 2, 'koordinator awal + tepat satu orang baru');
+  } finally { server.close(); }
+});
+
+test('parameter template (OTP) tersimpan terenkripsi dan ikut terhapus saat retensi', async () => {
+  const ctx = await setup();
+  const s = await seedBasic(ctx);
+  await ctx.auth.requestOtp(s.ana.phone, 'login');
+  const row = await ctx.db.get("SELECT * FROM wa_outbox WHERE kind = 'template'");
+  const code = ctx.crypto.decrypt(row.body_enc).match(/(\d{6})/)[1];
+  assert.ok(!row.template.includes(code), 'kode OTP tidak terbaca di kolom template');
+  assert.match(ctx.crypto.decrypt(row.template), new RegExp(code), 'dapat didekripsi untuk dikirim');
+  await ctx.worker.drain();
+  assert.equal((await ctx.db.get('SELECT status FROM wa_outbox WHERE id = ?', [row.id])).status, 'sent');
+  const { runRetention } = await import('../src/jobs/retention.js');
+  await runRetention(ctx, { now: Date.now() + 91 * 86_400_000 });
+  const after = await ctx.db.get('SELECT * FROM wa_outbox WHERE id = ?', [row.id]);
+  assert.equal(after.template, null);
+  assert.equal(after.body_enc, null);
+});
