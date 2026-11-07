@@ -9,11 +9,18 @@ export const b64u = {
 
 const RS = 4096;
 
+// getPrivateKey() membuang nol di depan, jadi ±1/256 kunci P-256 hanya 31 byte (atau kurang).
+// Kunci privat selalu dinormalkan ke 32 byte (RFC 8292 / JWK P-256 mewajibkan panjang tetap).
+function pad32(buf) {
+  if (buf.length > 32) throw new Error('VAPID_PRIVATE_KEY harus 32 byte (base64url)');
+  return buf.length === 32 ? buf : Buffer.concat([Buffer.alloc(32 - buf.length), buf]);
+}
+
 /** Pasangan kunci VAPID baru (P-256). Publik: titik tak terkompresi 65 byte; privat: skalar 32 byte. */
 export function generateVapidKeys() {
   const ecdh = createECDH('prime256v1');
   ecdh.generateKeys();
-  return { publicKey: b64u.enc(ecdh.getPublicKey()), privateKey: b64u.enc(ecdh.getPrivateKey()) };
+  return { publicKey: b64u.enc(ecdh.getPublicKey()), privateKey: b64u.enc(pad32(ecdh.getPrivateKey())) };
 }
 
 function jwk(publicKeyB64u, privateKeyB64u) {
@@ -21,9 +28,10 @@ function jwk(publicKeyB64u, privateKeyB64u) {
   if (pub.length !== 65 || pub[0] !== 4) throw new Error('VAPID_PUBLIC_KEY harus titik P-256 tak terkompresi (65 byte, base64url)');
   const key = { kty: 'EC', crv: 'P-256', x: b64u.enc(pub.subarray(1, 33)), y: b64u.enc(pub.subarray(33, 65)) };
   if (privateKeyB64u) {
-    const d = b64u.dec(privateKeyB64u);
-    if (d.length !== 32) throw new Error('VAPID_PRIVATE_KEY harus 32 byte (base64url)');
-    key.d = b64u.enc(d);
+    const raw = b64u.dec(privateKeyB64u);
+    if (!raw.length) throw new Error('VAPID_PRIVATE_KEY harus 32 byte (base64url)');
+    // Kunci 31 byte dari versi lama `npm run gen-keys` tetap diterima.
+    key.d = b64u.enc(pad32(raw));
   }
   return key;
 }
