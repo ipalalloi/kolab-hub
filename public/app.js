@@ -2,7 +2,9 @@
 const COLS = [['masuk', 'Masuk'], ['dikerjakan', 'Dikerjakan'], ['ditinjau', 'Ditinjau'], ['selesai', 'Selesai'], ['tertahan', 'Tertahan']];
 const COL_NAME = Object.fromEntries(COLS);
 const isStandalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-const state = { me: null, ws: localStorage.getItem('kh.ws') || null, stream: null, rerender: null };
+import { outbox, flush, newOpId } from './offline.js';
+
+const state = { me: null, ws: localStorage.getItem('kh.ws') || null, stream: null, rerender: null, pending: [] };
 
 function h(tag, attrs = {}, ...kids) {
   const el = document.createElement(tag);
@@ -109,6 +111,85 @@ async function endSession() {
   await clearPrivateCache();
 }
 
+// ---------- Web Push ----------
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const b64uToBytes = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+const bytesToB64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function currentPushSub() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const os = /android/i.test(ua) ? 'Android' : isIOS ? 'iOS' : /windows/i.test(ua) ? 'Windows' : /mac os/i.test(ua) ? 'macOS' : /linux/i.test(ua) ? 'Linux' : 'Perangkat';
+  const br = /edg\//i.test(ua) ? 'Edge' : /firefox/i.test(ua) ? 'Firefox' : /chrome|crios/i.test(ua) ? 'Chrome' : /safari/i.test(ua) ? 'Safari' : 'Peramban';
+  return `${br} ${os}${isStandalone ? ' (aplikasi)' : ''}`;
+}
+
+async function enablePush() {
+  const key = await api('GET', '/api/push/key');
+  if (!key.enabled) throw new Error('Notifikasi push belum diaktifkan di server.');
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') throw new Error('Izin notifikasi ditolak. Izinkan dari pengaturan situs di peramban, lalu coba lagi.');
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  // Kunci server diganti: langganan lama tidak bisa dipakai lagi.
+  if (sub && sub.options?.applicationServerKey && bytesToB64u(sub.options.applicationServerKey) !== key.public_key) { await sub.unsubscribe(); sub = null; }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key.public_key) });
+  await api('POST', '/api/push/subscribe', { subscription: sub.toJSON(), device: deviceLabel() });
+}
+
+async function disablePush() {
+  const sub = await currentPushSub();
+  if (!sub) return;
+  await api('POST', '/api/push/unsubscribe', { endpoint: sub.endpoint }).catch(() => {});
+  await sub.unsubscribe().catch(() => {});
+}
+
+/** Keluar: perangkat ini berhenti menerima notifikasi akun ini. */
+async function logout() {
+  const waiting = (await outbox.list(state.me?.person.id).catch(() => [])).filter((o) => o.status === 'menunggu').length;
+  if (waiting && !confirm(`Ada ${waiting} tindakan luring yang belum terkirim. Keluar sekarang akan menghapusnya dari perangkat ini. Lanjutkan?`)) return false;
+  const sub = await currentPushSub().catch(() => null);
+  await api('POST', '/api/auth/logout', { push_endpoint: sub?.endpoint });
+  await sub?.unsubscribe().catch(() => {});
+  await outbox.clear().catch(() => {});
+  await endSession();
+  return true;
+}
+
+async function notificationPanel() {
+  const me = state.me;
+  const box = h('div', { class: 'panel stack', style: 'margin-top:12px' }, h('h2', { style: 'margin:0' }, 'Notifikasi'));
+  const sub = await currentPushSub().catch(() => null);
+  const status = (text) => h('p', { class: 'muted', id: 'pushStatus' }, text);
+  if (!me.push?.enabled) box.append(status('Notifikasi push belum diaktifkan di server. Pemberitahuan tugas tetap dikirim lewat WhatsApp.'));
+  else if (!pushSupported()) box.append(status(isIOS && !isStandalone
+    ? 'Di iPhone/iPad, notifikasi hanya tersedia setelah Kolab-Hub dipasang: Bagikan → Tambah ke Layar Utama, lalu buka dari ikonnya (iOS 16.4 ke atas).'
+    : 'Peramban ini tidak mendukung notifikasi push. Pemberitahuan tetap lewat WhatsApp.'));
+  else if (Notification.permission === 'denied') box.append(status('Notifikasi diblokir untuk situs ini. Izinkan dari pengaturan situs di peramban.'));
+  else {
+    box.append(status(sub ? `Aktif di perangkat ini. Total perangkat Anda: ${me.push.devices}.` : (me.push.devices ? `Belum aktif di perangkat ini (aktif di ${me.push.devices} perangkat lain).` : 'Belum aktif. Tanpa push, pemberitahuan tugas dikirim lewat WhatsApp.')),
+      h('div', { class: 'row' },
+        sub ? h('button', { class: 'btn', id: 'pushOff', onclick: run(async () => { await disablePush(); await loadMe(); toast('Notifikasi dimatikan di perangkat ini'); state.rerender(); }) }, 'Matikan di perangkat ini')
+          : h('button', { class: 'btn primary', id: 'pushOn', onclick: run(async () => { await enablePush(); await loadMe(); toast('Notifikasi aktif'); state.rerender(); }) }, 'Aktifkan notifikasi'),
+        sub ? h('button', { class: 'btn', id: 'pushTest', onclick: run(async () => { await api('POST', '/api/push/test'); toast('Notifikasi uji dikirim'); }) }, 'Kirim uji') : null));
+  }
+  if (me.digest?.enabled) {
+    const f = h('form', { class: 'row' }, h('label', { class: 'grow', for: 'digestSel' }, `Ringkasan harian pukul ${me.digest.time} (${me.digest.tz})`),
+      h('select', { id: 'digestSel', name: 'digest', style: 'max-width:240px' },
+        [['auto', 'Otomatis (push, atau WA)'], ['push', 'Hanya push'], ['wa', 'Hanya WhatsApp'], ['off', 'Jangan kirim']].map(([v, l]) => h('option', { value: v, selected: me.person.digest_channel === v }, l))),
+      h('button', { class: 'btn small' }, 'Simpan'));
+    f.addEventListener('submit', run(async () => { await api('PATCH', '/api/me', { digest_channel: f.digest.value }); state.dirty = false; await loadMe(); toast('Pilihan ringkasan tersimpan'); }));
+    box.append(f);
+  }
+  return box;
+}
+
 // ---------- Tampilan ----------
 function viewLogin(main) {
   let phone = '';
@@ -173,7 +254,8 @@ function cardTile(c, { draggable = false } = {}) {
       c.due_date ? h('span', { class: `tag ${late ? 'late' : ''}` }, `${late ? 'Terlambat · ' : ''}${c.due_date}`) : null,
       c.priority !== 'normal' ? h('span', { class: `tag ${c.priority}` }, c.priority) : null,
       c.needs_review ? h('span', { class: 'tag review' }, 'perlu dicek') : null,
-      c.hold_reason ? h('span', { class: 'tag' }, `⏸ ${c.hold_reason}`) : null),
+      c.hold_reason ? h('span', { class: 'tag' }, `⏸ ${c.hold_reason}`) : null,
+      state.pending.some((o) => o.code === c.code && o.status === 'menunggu') ? h('span', { class: 'tag pending' }, '⏳ menunggu kirim') : null),
     c.progress ? h('div', { class: 'progress', 'aria-label': `progres ${c.progress}%` }, h('span', { style: `width:${c.progress}%` })) : null);
   if (draggable) el.addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', c.code));
   return el;
@@ -227,13 +309,77 @@ async function quick(code, action) {
   if (action === 'bantuan') { const n = prompt('Bantuan apa yang dibutuhkan?'); if (n === null) return; args.note = n; }
   if (action === 'tahan') { const r = prompt('Alasan menahan kartu?'); if (!r) return; args.reason = r; }
   if (action === 'revisi') { const r = prompt('Catatan revisi?'); if (!r) return; args.note = r; }
-  await api('POST', `/api/cards/${code}/actions`, args);
-  toast(`${code} diperbarui`);
+  const r = await sendAction(code, args);
+  toast(r.queued ? `Luring: ${code} disimpan dan dikirim saat tersambung` : `${code} diperbarui`);
+}
+
+// ---------- Antrean luring ----------
+const ACTION_LABEL = { mulai: 'Mulai', progres: 'Lapor progres', selesai: 'Selesai', tahan: 'Tahan', bantuan: 'Minta bantuan', setujui: 'Setujui', revisi: 'Minta revisi', cek: 'Tandai dicek', komentar: 'Komentar' };
+
+async function postOp(op, { replay }) {
+  const res = await fetch(`/api/cards/${encodeURIComponent(op.code)}/actions`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json', 'x-kolab-csrf': '1', 'x-kolab-client': isStandalone ? 'pwa' : 'web', 'x-kolab-op-id': op.op_id },
+    body: JSON.stringify(replay ? { ...op.args, queued_at: op.queued_at } : op.args),
+  });
+  return { status: res.status, data: await res.json().catch(() => ({})) };
+}
+
+/** Kirim tindakan kartu; bila tidak ada sinyal, simpan ke antrean perangkat. */
+async function sendAction(code, args) {
+  const op = { op_id: newOpId(), code, args, queued_at: new Date().toISOString(), person_id: state.me?.person.id };
+  const queue = async () => { await outbox.add(op); await refreshPending(); return { queued: true }; };
+  if (!navigator.onLine) return queue();
+  let r;
+  try { r = await postOp(op, { replay: false }); } catch { return queue(); } // jaringan putus di tengah jalan: op_id menjaga dari dobel
+  if (r.status === 401) { await clearPrivateCache(); location.hash = '#/masuk'; throw new Error('Silakan masuk'); }
+  if (r.status < 200 || r.status >= 300) throw new Error(r.data.error || `Gagal (${r.status})`);
+  return r.data;
+}
+
+async function refreshPending() {
+  state.pending = state.me ? await outbox.list(state.me.person.id).catch(() => []) : [];
+  const waiting = state.pending.filter((o) => o.status === 'menunggu').length;
+  const bar = document.getElementById('offline');
+  bar.textContent = navigator.onLine
+    ? (waiting ? `Mengirim ${waiting} tindakan luring…` : '')
+    : `Luring — tampilan mungkin tidak terbaru.${waiting ? ` ${waiting} tindakan menunggu dikirim.` : ' Tindakan tetap bisa dilakukan dan dikirim saat tersambung.'}`;
+  bar.hidden = navigator.onLine && !waiting;
+}
+
+let flushing = false;
+async function flushPending() {
+  if (flushing || !navigator.onLine || !state.me) return;
+  flushing = true;
+  try {
+    const r = await flush(state.me.person.id, (op) => postOp(op, { replay: true }));
+    if (r.stopped === 'sesi') { location.hash = '#/masuk'; }
+    if (r.sent) toast(`${r.sent} tindakan luring terkirim`);
+    if (r.rejected.length) toast(`${r.rejected.length} tindakan luring ditolak server — lihat Tugas saya`);
+    if (r.sent || r.rejected.length) state.rerender?.();
+  } finally { flushing = false; await refreshPending(); }
+}
+
+function pendingPanel() {
+  if (!state.pending.length) return null;
+  const waiting = state.pending.filter((o) => o.status === 'menunggu');
+  const rejected = state.pending.filter((o) => o.status === 'ditolak');
+  const when = (o) => new Date(o.queued_at).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' });
+  const detail = (o) => (o.args.percent !== undefined ? ` ${o.args.percent}%` : '');
+  return h('div', { class: 'panel stack', id: 'pendingPanel', style: 'margin-bottom:12px' },
+    waiting.length ? h('div', {}, h('b', {}, `Menunggu dikirim (${waiting.length})`),
+      h('ul', { class: 'plain' }, waiting.map((o) => h('li', {}, `⏳ ${o.code} · ${ACTION_LABEL[o.args.action] || o.args.action}${detail(o)} · ${when(o)}`)))) : null,
+    rejected.length ? h('div', {}, h('b', {}, `Ditolak server (${rejected.length})`),
+      h('ul', { class: 'plain' }, rejected.map((o) => h('li', { class: 'row' }, h('span', { class: 'grow' }, `⚠️ ${o.code} · ${ACTION_LABEL[o.args.action] || o.args.action}${detail(o)} · ${when(o)} — ${o.error}`),
+        h('button', { class: 'btn small', onclick: run(async () => { await outbox.remove(o.op_id); await refreshPending(); state.rerender(); }) }, 'Tutup'))))) : null);
 }
 
 async function viewMyTasks(main) {
   const tasks = await api('GET', '/api/my/tasks');
   main.append(h('h1', {}, 'Tugas saya'));
+  await refreshPending();
+  const pp = pendingPanel();
+  if (pp) main.append(pp);
   if (!isStandalone && /iphone|ipad/i.test(navigator.userAgent)) main.append(h('p', { class: 'muted' }, 'Tip iPhone: Bagikan → Tambah ke Layar Utama agar Kolab-Hub bisa dipakai seperti aplikasi.'));
   if (!tasks.length) { main.append(h('p', { class: 'panel' }, 'Tidak ada tugas aktif. 👍')); return; }
   for (const c of tasks) {
@@ -339,6 +485,7 @@ function eventDetail(e) {
   const p = e.payload || {};
   const bits = [];
   if (p.percent !== undefined) bits.push(`${p.percent}%`);
+  if (p.offline_at) bits.push(`(dilakukan luring ${new Date(p.offline_at).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' })})`);
   if (p.to) bits.push(`→ ${COL_NAME[p.to]}`);
   for (const k of ['note', 'reason', 'text']) if (p[k]) bits.push(`“${p[k]}”`);
   if (p.fields) bits.push(Object.entries(p.fields).map(([k, v]) => `${k}: ${v}`).join(', '));
@@ -418,8 +565,9 @@ async function viewAccount(main) {
     h('p', {}, h('b', {}, me.person.name), ` · ${me.person.phone}`),
     h('div', { class: 'row' },
       h('a', { class: 'btn', href: '/api/me/export', download: 'data-saya-kolab-hub.json' }, 'Ekspor data saya'),
-      h('button', { class: 'btn', onclick: run(async () => { await api('POST', '/api/auth/logout'); await endSession(); location.hash = '#/masuk'; }) }, 'Keluar'),
-      h('button', { class: 'btn danger', onclick: run(async () => { if (!confirm('Hapus akun dan nomor Anda? Riwayat kerja tetap ada atas nama "Mantan anggota".')) return; await api('DELETE', '/api/me'); await endSession(); location.hash = '#/masuk'; location.reload(); }) }, 'Hapus akun'))));
+      h('button', { class: 'btn', onclick: run(async () => { if (await logout()) location.hash = '#/masuk'; }) }, 'Keluar'),
+      h('button', { class: 'btn danger', onclick: run(async () => { if (!confirm('Hapus akun dan nomor Anda? Riwayat kerja tetap ada atas nama "Mantan anggota".')) return; const sub = await currentPushSub().catch(() => null); await api('DELETE', '/api/me'); await sub?.unsubscribe().catch(() => {}); await outbox.clear().catch(() => {}); await endSession(); location.hash = '#/masuk'; location.reload(); }) }, 'Hapus akun'))),
+    await notificationPanel());
   for (const m of me.memberships) {
     const f = h('form', { class: 'panel row', style: 'margin-top:12px' }, h('b', { class: 'grow' }, `${m.workspace_name} (${m.role})`),
       h('select', { name: 'availability', style: 'max-width:180px' }, ['tersedia', 'sibuk', 'cuti'].map((a) => h('option', { value: a, selected: a === m.availability }, a))),
@@ -444,6 +592,8 @@ async function viewAccount(main) {
 async function loadMe() {
   try { state.me = await api('GET', '/api/me'); } catch { state.me = null; }
   if (state.me && !state.ws && state.me.memberships[0]) state.ws = state.me.memberships[0].workspace_id;
+  // Antrean milik akun lain yang pernah masuk di perangkat ini tidak boleh terkirim atas nama akun ini.
+  if (state.me) await outbox.clear(state.me.person.id).catch(() => {});
   return state.me;
 }
 
@@ -471,8 +621,13 @@ async function render() {
 }
 
 window.addEventListener('hashchange', render);
-window.addEventListener('online', () => { document.getElementById('offline').hidden = true; render(); });
-window.addEventListener('offline', () => { document.getElementById('offline').hidden = false; });
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
-document.getElementById('offline').hidden = navigator.onLine;
-loadMe().then(render);
+window.addEventListener('online', async () => { await refreshPending(); await flushPending(); render(); });
+window.addEventListener('offline', refreshPending);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') flushPending(); });
+setInterval(flushPending, 30_000);
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // Klik notifikasi saat aplikasi sudah terbuka (peramban tanpa client.navigate).
+  navigator.serviceWorker.addEventListener('message', (e) => { if (e.data?.type === 'open' && new URL(e.data.url).origin === location.origin) location.href = e.data.url; });
+}
+loadMe().then(async () => { await refreshPending(); await render(); await flushPending(); });

@@ -1,6 +1,6 @@
 // Aturan transisi kartu dan hak akses. Dipakai bersama oleh web, PWA, dan WhatsApp.
 import { HttpError } from '../lib/util.js';
-import { appendCardEvent, lockCard } from './store.js';
+import { appendCardEvent as appendEvent, lockCard } from './store.js';
 
 export const MANAGER_ROLES = new Set(['owner', 'coordinator']);
 const COLUMN_KEYS = new Set(['masuk', 'dikerjakan', 'ditinjau', 'selesai', 'tertahan']);
@@ -76,7 +76,18 @@ export function allowedActions(card, membership, personId) {
  * @param actor {person_id}
  * @param action mulai|progres|selesai|tahan|lanjut|setujui|revisi|pindah|tugaskan|ubah|komentar|bantuan|hapus|cek
  */
-export async function performCardAction(t, { card: given, actor, action, args = {}, source, wa_message_id }) {
+/**
+ * Waktu tindakan dilakukan di perangkat saat luring (ISO-8601). Diterima bila tidak lebih dari
+ * 7 hari lalu dan tidak di masa depan (toleransi jam perangkat 5 menit). Selain itu diabaikan.
+ */
+export function parseOfflineAt(v, now = Date.now()) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(v)) return null;
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms) || ms > now + 5 * 60_000 || ms < now - 7 * 86_400_000) return null;
+  return new Date(ms).toISOString();
+}
+
+export async function performCardAction(t, { card: given, actor, action, args = {}, source, wa_message_id, offline_at }) {
   // Validasi selalu terhadap keadaan terkunci terbaru, bukan salinan yang dibaca sebelum transaksi.
   const card = await lockCard(t, given.id);
   if (!card || card.deleted_at) throw new HttpError(404, 'Kartu tidak ditemukan');
@@ -85,6 +96,9 @@ export async function performCardAction(t, { card: given, actor, action, args = 
   const isAssignee = card.assignee_id && card.assignee_id === actor.person_id;
   const col = card.column_key;
   const base = { source, actor_id: actor.person_id, wa_message_id };
+  const offlineAt = parseOfflineAt(offline_at);
+  // Tindakan dari antrean luring mencatat kapan sebenarnya dilakukan; urutan tetap mengikuti saat diterima server.
+  const appendCardEvent = (tx, c, ev) => appendEvent(tx, c, offlineAt ? { ...ev, payload: { ...ev.payload, offline_at: offlineAt } } : ev);
   const ensureWorker = () => {
     if (m.role === 'viewer') throw new HttpError(403, 'Pemantau hanya dapat melihat', 'forbidden');
     if (!isManager && !isAssignee) throw new HttpError(403, `Kartu ${card.code} bukan tugas Anda`, 'not_assignee');
@@ -193,5 +207,5 @@ export async function revertEvent(t, { seq, actor, reason, source }) {
   await requireRole(t, card.workspace_id, actor.person_id, ['owner', 'coordinator']);
   const already = await t.get("SELECT seq FROM events WHERE card_id = ? AND type = 'event.reverted' AND payload LIKE ?", [card.id, `%"target_seq":${Number(seq)},%`]);
   if (already) throw new HttpError(409, 'Event ini sudah dibatalkan');
-  return appendCardEvent(t, card, { type: 'event.reverted', source, actor_id: actor.person_id, payload: { target_seq: Number(seq), target_type: ev.type, reason: reason || '' } });
+  return appendEvent(t, card, { type: 'event.reverted', source, actor_id: actor.person_id, payload: { target_seq: Number(seq), target_type: ev.type, reason: reason || '' } });
 }

@@ -70,3 +70,49 @@ export async function lastReply(ctx, phone) {
 export async function card(ctx, code) {
   return ctx.db.get('SELECT * FROM cards WHERE code = ?', [code]);
 }
+
+/** Jalankan server HTTP uji pada port acak. */
+export async function startServer(ctx) {
+  const { createServer } = await import('node:http');
+  const { createHandler } = await import('../src/server.js');
+  const server = createServer(createHandler(ctx));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return { server, base: `http://127.0.0.1:${server.address().port}` };
+}
+
+/** Masuk lewat OTP (kode dibaca dari outbox simulasi); mengembalikan pemanggil API ber-cookie. */
+export async function login(ctx, base, phone) {
+  const H = { 'content-type': 'application/json', 'x-kolab-csrf': '1' };
+  await fetch(`${base}/api/auth/otp`, { method: 'POST', headers: H, body: JSON.stringify({ phone }) });
+  const code = (await lastReply(ctx, phone)).text.match(/(\d{6})/)[1];
+  const r = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: H, body: JSON.stringify({ phone, code }) });
+  if (r.status !== 200) throw new Error(`login gagal ${r.status}`);
+  const cookie = r.headers.get('set-cookie').split(';')[0];
+  return async (method, path, body, headers = {}) => {
+    const res = await fetch(base + path, { method, headers: { ...H, cookie, ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const text = await res.text();
+    let data; try { data = JSON.parse(text); } catch { data = text; }
+    return { status: res.status, data, headers: res.headers };
+  };
+}
+
+/** Langganan push palsu dengan kunci P-256 asli, seperti yang dibuat peramban. */
+export async function fakeBrowserSubscription(n = 1) {
+  const { createECDH, randomBytes } = await import('node:crypto');
+  const ecdh = createECDH('prime256v1');
+  ecdh.generateKeys();
+  const auth = randomBytes(16).toString('base64url');
+  return {
+    subscription: { endpoint: `https://push.contoh.test/kirim/${n}-${randomBytes(4).toString('hex')}`, keys: { p256dh: ecdh.getPublicKey().toString('base64url'), auth } },
+    uaPrivateKey: ecdh.getPrivateKey().toString('base64url'),
+    auth,
+  };
+}
+
+/** Layanan push palsu: mencatat permintaan dan membalas sesuai `status(endpoint)`. */
+export function fakePushService(status = () => 201) {
+  const calls = [];
+  const fn = async (url, init) => { calls.push({ url, ...init }); return { status: status(url, calls.length) }; };
+  fn.calls = calls;
+  return fn;
+}

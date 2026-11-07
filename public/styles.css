@@ -71,3 +71,15 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); v
   .board { grid-auto-columns: 85%; }
   #nav a { padding: 6px 8px; }
 }
+
+/* Fase 2 */
+.tag.pending { background: #fff4cc; color: #5c4400; }
+ul.plain { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 4px; }
+.bars { display: grid; gap: 2px; min-width: 120px; }
+.bar { height: 8px; border-radius: 4px; background: var(--line, #ddd); overflow: hidden; display: flex; }
+.bar span { display: block; height: 100%; }
+.bar .b-kerja { background: #0f5c4c; } .bar .b-masuk { background: #8aa9a0; } .bar .b-tinjau { background: #c08a00; } .bar .b-tahan { background: #a33; }
+.over { color: #a33; font-weight: 600; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+.table-scroll { overflow-x: auto; }

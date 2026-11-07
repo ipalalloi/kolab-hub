@@ -60,8 +60,27 @@ export function loadConfig(env = process.env) {
     workerInline: (env.WORKER_INLINE || 'true') === 'true',
     defaultWipLimit: Number(env.DEFAULT_WIP_LIMIT || 3),
     filesDir: env.FILES_DIR || 'data/files',
+    // Web Push (VAPID). Kosong = push nonaktif; notifikasi kembali ke WA seperti MVP.
+    push: {
+      publicKey: env.VAPID_PUBLIC_KEY || '',
+      privateKey: env.VAPID_PRIVATE_KEY || '',
+      subject: env.VAPID_SUBJECT || '',
+      ttlSec: Number(env.PUSH_TTL_SECONDS || 86_400),
+    },
+    // Ringkasan harian: satu pesan per orang per hari pada jam lokal DIGEST_TIME di zona DIGEST_TZ.
+    digest: {
+      enabled: (env.DIGEST_ENABLED || 'true') === 'true',
+      time: /^\d{2}:\d{2}$/.test(env.DIGEST_TIME || '') ? env.DIGEST_TIME : '07:00',
+      tz: env.DIGEST_TZ || 'Asia/Makassar',
+      template: env.WA_DIGEST_TEMPLATE || 'kolab_ringkasan_harian',
+    },
     secureCookies: (env.SECURE_COOKIES || (env.NODE_ENV === 'production' ? 'true' : 'false')) === 'true',
   };
+  if (cfg.push.publicKey || cfg.push.privateKey) {
+    if (!cfg.push.publicKey || !cfg.push.privateKey) throw new Error('VAPID_PUBLIC_KEY dan VAPID_PRIVATE_KEY harus diisi berpasangan');
+    if (!/^(mailto:|https:)/.test(cfg.push.subject)) throw new Error('VAPID_SUBJECT wajib diisi, mis. mailto:admin@domain-anda');
+  }
+  try { new Intl.DateTimeFormat('en-US', { timeZone: cfg.digest.tz }); } catch { throw new Error(`DIGEST_TZ tidak dikenal: ${cfg.digest.tz}`); }
   if (cfg.env === 'production' && cfg.keys.encryption === DEV_KEY) throw new Error('ENCRYPTION_KEY pengembangan dilarang di produksi');
   if (cfg.env === 'production' && waMode === 'simulate' && env.ALLOW_SIMULATE_IN_PRODUCTION !== 'true') {
     throw new Error('WA_MODE=simulate tidak boleh di produksi (set ALLOW_SIMULATE_IN_PRODUCTION=true untuk uji coba)');
