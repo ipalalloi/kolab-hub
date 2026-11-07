@@ -14,8 +14,8 @@ Rancangan resmi (berstatus FINAL per 7 November 2026) ada di dokumen *Kajian & R
 
 | Fase | Isi | Status |
 | --- | --- | --- |
-| MVP | Workspace, anggota dan verifikasi nomor, kanban, kartu, event log, webhook WA (tanda tangan, antrean, idempoten), perintah `#kode mulai/progres/selesai/tahan`, `#tugasku`, PWA dasar, mode simulasi WA | cabang `feat/mvp` |
-| Fase 2 | Web Push, mode luring dengan antrean sinkron, ringkasan harian, dasbor beban kerja, ekspor | belum |
+| MVP | Workspace, anggota dan verifikasi nomor, kanban, kartu, event log, webhook WA (tanda tangan, antrean, idempoten), perintah `#kode mulai/progres/selesai/tahan`, `#tugasku`, PWA dasar, mode simulasi WA | di `main`, berjalan di VPS |
+| Fase 2 | Web Push, mode luring dengan antrean sinkron, ringkasan harian, dasbor beban kerja, ekspor | cabang `feat/fase-2` |
 | Fase 3 | Parsing bahasa alami terbatas, saran penugasan, integrasi kalender/Drive | belum |
 
 ## Arsitektur singkat
@@ -121,6 +121,63 @@ Contoh di bawah untuk Ubuntu 24.04 dengan Docker.
 
 Bila BSP menandatangani webhook dengan skema yang berbeda dari `X-Hub-Signature-256`, sesuaikan `src/wa/webhook.js` sebelum produksi. Sistem menolak setiap request yang tanda tangannya tidak cocok.
 
+## Fase 2: push, luring, ringkasan, beban kerja, ekspor
+
+### Web Push (push-first)
+
+Notifikasi dikirim lewat Web Push PWA (gratis) bila penerima sudah mengaktifkannya; WhatsApp hanya cadangan.
+
+| Kejadian | Penerima | Kanal |
+| --- | --- | --- |
+| Kartu ditugaskan | penanggung jawab | push; bila belum berlangganan → template WA `kolab_tugas_baru` (seperti MVP) |
+| Kartu ditandai selesai (menunggu tinjauan) | pemilik dan koordinator | hanya push |
+| Revisi diminta | penanggung jawab | hanya push |
+| Minta bantuan | pemilik dan koordinator | hanya push |
+
+Pelaku tidak diberi tahu tentang tindakannya sendiri. Notifikasi selain penugasan dibaca dari event log, jadi berlaku sama untuk laporan dari web, PWA, maupun WA.
+
+Pengaktifan di VPS:
+
+1. `npm run gen-keys` lalu salin `VAPID_PUBLIC_KEY` dan `VAPID_PRIVATE_KEY` ke `.env` (jangan ke chat atau repo). Isi juga `VAPID_SUBJECT=mailto:admin@domain-anda`.
+2. Restart. Server menolak start bila kunci tidak berpasangan atau subjek kosong.
+3. Anggota membuka **Akun → Aktifkan notifikasi** lalu **Kirim uji**.
+
+Catatan perangkat: di iPhone/iPad (iOS 16.4+) push hanya tersedia setelah Kolab-Hub dipasang ke Layar Utama dan dibuka dari ikonnya. Mode penyamaran tidak mendukung push. Mengganti kunci VAPID membatalkan semua langganan; anggota perlu mengaktifkan ulang.
+
+Enkripsi isi notifikasi (RFC 8291) dan VAPID (RFC 8292) ditulis dengan `node:crypto` tanpa paket tambahan dan diuji byte demi byte terhadap vektor uji RFC 8291. Endpoint dan kunci langganan disimpan terenkripsi. Langganan yang dicabut atau kedaluwarsa (HTTP 404/410) dihapus otomatis.
+
+### Mode luring
+
+Di PWA, tindakan kartu (mulai, lapor progres, selesai, tahan, bantuan, komentar, dan tombol koordinator) tetap bisa dilakukan tanpa sinyal. Tindakan disimpan di perangkat (IndexedDB) dan dikirim berurutan saat tersambung lagi, saat aplikasi dibuka, atau tiap 30 detik.
+
+- Setiap tindakan membawa `x-kolab-op-id` unik. Server mencatatnya di `client_ops`, jadi kiriman ulang tidak pernah tercatat dua kali.
+- Waktu tindakan dilakukan dicatat di event sebagai `offline_at` (diterima bila ≤ 7 hari lalu dan tidak di masa depan). Urutan di log tetap urutan diterima server.
+- Tindakan divalidasi terhadap keadaan kartu terbaru. Bila ditolak (misalnya kartu sudah disetujui orang lain), tindakan muncul di **Tugas saya → Ditolak server** beserta alasannya.
+- Tugas saya, akun, detail kartu, dan papan yang pernah dibuka dapat dibaca saat luring. Salinan ini dan antrean dihapus saat keluar akun.
+
+### Ringkasan harian
+
+Satu pesan per orang per hari pada `DIGEST_TIME` (bawaan 07:00) di zona `DIGEST_TZ` (bawaan `Asia/Makassar`). Isinya tugas aktif, terlambat, tenggat hari ini, tertahan, dan untuk koordinator jumlah kartu menunggu tinjauan, perlu dicek, serta usulan baru. Orang tanpa apa pun untuk dilaporkan tidak dikirimi.
+
+- Kanal per orang di **Akun**: otomatis (push bila ada, selain itu WA), hanya push, hanya WA, atau tidak dikirim.
+- Ringkasan lewat WA berada di luar jendela 24 jam, jadi wajib template. Ajukan template **utility** `kolab_ringkasan_harian`: `Ringkasan {{1}}: {{2}}. Lihat tugas Anda: {{3}}`.
+- Pemasangan pertama hanya menandai hari itu; ringkasan pertama keluar keesokan harinya, bukan saat server diperbarui.
+
+### Dasbor beban kerja dan ekspor
+
+Menu **Beban kerja** (pemilik dan koordinator) menampilkan per anggota: kartu masuk/dikerjakan/ditinjau/tertahan, pemakaian WIP, terlambat, tenggat 7 hari, kartu disetujui dalam 7/30/90 hari, dan median hari sampai disetujui. Persetujuan yang dibatalkan tidak dihitung.
+
+Ekspor CSV (UTF-8 dengan BOM, pilihan pemisah koma atau titik koma untuk Excel berbahasa Indonesia): daftar kartu (filter proyek dan status), riwayat kejadian (rentang tanggal, maksimal 366 hari), dan beban kerja. Sel yang bisa dibaca sebagai rumus diawali `'` untuk mencegah CSV injection. Setiap ekspor dicatat di audit log.
+
+### Memperbarui VPS ke Fase 2
+
+```
+git pull
+npm run migrate        # 002 (tanggal tinjau transfer) dan 003 (tabel Fase 2)
+npm run gen-keys       # ambil baris VAPID_* saja, tempel ke .env
+pm2 restart all
+```
+
 ## Keamanan dan kepatuhan (ringkas)
 
 - **Rahasia** hanya di `.env` pada VPS. Repo hanya berisi `.env.example` tanpa nilai.
@@ -155,10 +212,13 @@ src/
   db/                adapter SQLite/PostgreSQL + migrasi
   domain/            reducer event, aturan transisi + hak akses, penulisan event
   wa/                parser perintah, webhook, pemroses pesan, pengirim
+  push/              Web Push: enkripsi RFC 8291 + VAPID, langganan, pengiriman
+  notify/            kebijakan push-first, notifikasi dari event log, ringkasan harian
   jobs/              antrean, worker, retensi
   auth/              OTP WhatsApp + sesi
   api/routes.js      endpoint JSON
-public/              PWA (index, app.js, sw.js, manifest) + simulator /sim
+  api/reports.js     dasbor beban kerja dan ekspor CSV
+public/              PWA (index, app.js, offline.js, sw.js, manifest) + simulator /sim
 scripts/             seed, create-owner, gen-keys
 deploy/              Caddyfile, backup.sh
 test/                uji node:test (unit, WhatsApp end-to-end, API HTTP)
