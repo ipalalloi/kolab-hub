@@ -5,6 +5,7 @@ import { readJson } from '../http/http.js';
 import { performCardAction, revertEvent, requireRole, getCardByCode, getMembership, allowedActions, MANAGER_ROLES } from '../domain/actions.js';
 import { createCard, audit, defaultColumns, rowToEvent, appendWorkspaceEvent } from '../domain/store.js';
 import { runRetention } from '../jobs/retention.js';
+import { registerReports } from './reports.js';
 
 export const CONSENT_VERSION = 'privasi-2026-11-07';
 const ROLES = ['owner', 'coordinator', 'collaborator', 'viewer'];
@@ -36,18 +37,8 @@ export function registerRoutes(router, ctx) {
   const client = (req) => (req.headers['x-kolab-client'] === 'pwa' ? 'pwa' : 'web');
   const need = (req) => { if (!req.person) throw new HttpError(401, 'Silakan masuk dulu', 'unauthenticated'); return req.person; };
 
-  async function notifyAssignment(t, card, assigneeId) {
-    if (!assigneeId) return;
-    const p = await t.get('SELECT * FROM people WHERE id = ? AND erased_at IS NULL', [assigneeId]);
-    const phone = p && crypto.decrypt(p.phone_enc);
-    if (!phone) return;
-    const url = `${cfg.baseUrl}/#/kartu/${card.code}`;
-    await outbound.template(t, {
-      phone, person_id: p.id, workspace_id: card.workspace_id, card_id: card.id,
-      text: `Tugas baru ${card.code}: ${card.title}\nBalas pesan ini dengan "mulai" untuk mulai mengerjakan.\n${url}`,
-      template: { name: cfg.wa.assignTemplate, components: [{ type: 'body', parameters: [{ type: 'text', text: card.code }, { type: 'text', text: card.title }, { type: 'text', text: url }] }] },
-    });
-  }
+  // Push-first: Web Push bila penerima berlangganan, selain itu template WA (lihat src/notify/notifier.js).
+  const notifyAssignment = (t, card, assigneeId) => (assigneeId ? ctx.notifier.assignment(t, card, assigneeId) : null);
 
   // `me` = baris membership peminta; bila ada, kartu membawa daftar tombol yang boleh ditampilkan.
   async function cardView(t, card, me) {
@@ -79,6 +70,9 @@ export function registerRoutes(router, ctx) {
   });
 
   router.post('/api/auth/logout', async (req) => {
+    const b = await readJson(req);
+    // Perangkat yang keluar berhenti menerima notifikasi akun ini.
+    if (req.person && b.push_endpoint) await ctx.push.unsubscribe(db, req.person.id, b.push_endpoint);
     await auth.destroySession(req.sessionToken);
     return { status: 200, headers: { 'set-cookie': auth.cookieHeader('', 0) }, body: { ok: true } };
   });
@@ -88,7 +82,52 @@ export function registerRoutes(router, ctx) {
     const memberships = await db.all(
       `SELECT m.workspace_id, m.role, m.availability, m.wip_limit, m.skills, w.name AS workspace_name, w.retention_days
        FROM memberships m JOIN workspaces w ON w.id = m.workspace_id WHERE m.person_id = ? AND m.removed_at IS NULL ORDER BY w.name`, [p.id]);
-    return { person: { ...personView(p), phone: maskPhone(crypto.decrypt(p.phone_enc)) }, memberships, wa_mode: cfg.wa.mode };
+    return {
+      person: { ...personView(p), phone: maskPhone(crypto.decrypt(p.phone_enc)), digest_channel: p.digest_channel },
+      memberships, wa_mode: cfg.wa.mode,
+      push: { enabled: ctx.push.enabled, devices: await ctx.push.count(db, p.id) },
+      digest: { enabled: cfg.digest.enabled, time: cfg.digest.time, tz: cfg.digest.tz },
+    };
+  });
+
+  router.patch('/api/me', async (req) => {
+    const p = need(req);
+    const b = await readJson(req);
+    if (b.digest_channel !== undefined) {
+      if (!['auto', 'push', 'wa', 'off'].includes(b.digest_channel)) throw new HttpError(400, 'Pilihan kanal ringkasan tidak dikenal');
+      await db.run('UPDATE people SET digest_channel = ? WHERE id = ?', [b.digest_channel, p.id]);
+      await audit(db, { actor_id: p.id, action: 'person.digest_channel', detail: { digest_channel: b.digest_channel }, ip: req.ip });
+    }
+    return { ok: true };
+  });
+
+  // ---------- Web Push ----------
+  router.get('/api/push/key', async (req) => {
+    const p = need(req);
+    return { enabled: ctx.push.enabled, public_key: ctx.push.publicKey, devices: await ctx.push.count(db, p.id) };
+  });
+
+  router.post('/api/push/subscribe', async (req) => {
+    const p = need(req);
+    const b = await readJson(req);
+    const id = await db.tx((t) => ctx.push.subscribe(t, p.id, b.subscription, b.device));
+    await audit(db, { actor_id: p.id, action: 'push.subscribed', target: id, ip: req.ip });
+    return { ok: true, devices: await ctx.push.count(db, p.id) };
+  });
+
+  router.post('/api/push/unsubscribe', async (req) => {
+    const p = need(req);
+    const b = await readJson(req);
+    const removed = await ctx.push.unsubscribe(db, p.id, b.endpoint);
+    if (removed) await audit(db, { actor_id: p.id, action: 'push.unsubscribed', ip: req.ip });
+    return { ok: true, devices: await ctx.push.count(db, p.id) };
+  });
+
+  router.post('/api/push/test', async (req) => {
+    const p = need(req);
+    const n = await db.tx((t) => ctx.push.notify(t, p.id, { title: 'Kolab-Hub', body: 'Notifikasi push aktif di perangkat ini. 👍', url: '/#/akun', tag: 'uji-push' }));
+    if (!n) throw new HttpError(409, 'Belum ada perangkat yang berlangganan notifikasi', 'no_devices');
+    return { ok: true, devices: n };
   });
 
   // ---------- Undangan dan verifikasi nomor ----------
@@ -341,16 +380,40 @@ export function registerRoutes(router, ctx) {
   router.post('/api/cards/:code/actions', async (req, { code }) => {
     const p = need(req);
     const b = await readJson(req);
+    // Antrean luring: perangkat mengirim id operasi unik; kiriman ulang mendapat jawaban yang sama, tidak dicatat dua kali.
+    const opId = req.headers['x-kolab-op-id'];
+    if (opId !== undefined && !/^[A-Za-z0-9_-]{8,64}$/.test(opId)) throw new HttpError(400, 'Id operasi tidak sah', 'bad_op_id');
+    if (opId) {
+      const done = await db.get('SELECT * FROM client_ops WHERE op_id = ?', [opId]);
+      if (done) {
+        if (done.person_id !== p.id) throw new HttpError(409, 'Id operasi sudah dipakai', 'op_conflict');
+        return { status: Number(done.status), headers: { 'x-kolab-op-replayed': '1' }, body: parseJson(done.response, {}) };
+      }
+    }
     const card = await getCardByCode(db, code);
     if (!card) throw new HttpError(404, 'Kartu tidak ditemukan');
-    const me = await db.tx(async (t) => {
-      const fresh = await t.get('SELECT * FROM cards WHERE id = ?', [card.id]);
-      const { action, ...args } = b;
-      await performCardAction(t, { card: fresh, actor: { person_id: p.id }, action, args, source: client(req) });
-      if (action === 'tugaskan' && args.assignee_id && args.assignee_id !== fresh.assignee_id) await notifyAssignment(t, fresh, args.assignee_id);
-      return getMembership(t, fresh.workspace_id, p.id);
-    });
-    return cardView(db, await db.get('SELECT * FROM cards WHERE id = ?', [card.id]), me);
+    const { action, queued_at, ...args } = b;
+    try {
+      const me = await db.tx(async (t) => {
+        const fresh = await t.get('SELECT * FROM cards WHERE id = ?', [card.id]);
+        await performCardAction(t, { card: fresh, actor: { person_id: p.id }, action, args, source: client(req), offline_at: opId ? queued_at : undefined });
+        if (action === 'tugaskan' && args.assignee_id && args.assignee_id !== fresh.assignee_id) await notifyAssignment(t, fresh, args.assignee_id);
+        const m = await getMembership(t, fresh.workspace_id, p.id);
+        if (opId) {
+          const view = await cardView(t, await t.get('SELECT * FROM cards WHERE id = ?', [card.id]), m);
+          await t.run('INSERT INTO client_ops (op_id, person_id, card_code, status, response, created_at) VALUES (?, ?, ?, ?, ?, ?)', [opId, p.id, card.code, 200, JSON.stringify(view), nowIso()]);
+        }
+        return m;
+      });
+      return cardView(db, await db.get('SELECT * FROM cards WHERE id = ?', [card.id]), me);
+    } catch (e) {
+      // Penolakan aturan (4xx) juga dicatat: kiriman ulang dari antrean mendapat penolakan yang sama.
+      if (opId && e instanceof HttpError && e.status < 500) {
+        await db.run('INSERT INTO client_ops (op_id, person_id, card_code, status, response, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (op_id) DO NOTHING',
+          [opId, p.id, card.code, e.status, JSON.stringify({ error: e.message, code: e.code }), nowIso()]);
+      }
+      throw e;
+    }
   });
 
   router.post('/api/events/:seq/revert', async (req, { seq }) => {
@@ -442,11 +505,12 @@ export function registerRoutes(router, ctx) {
     const events = (await db.all('SELECT seq, workspace_id, card_id, type, source, payload, created_at FROM events WHERE actor_id = ? ORDER BY seq', [p.id])).map(rowToEvent);
     const messages = (await db.all('SELECT meta_id, msg_type, body_enc, status, received_at, content_purged_at FROM wa_messages WHERE person_id = ? ORDER BY received_at', [p.id]))
       .map((m) => ({ meta_id: m.meta_id, type: m.msg_type, status: m.status, received_at: m.received_at, text: m.content_purged_at ? null : crypto.decrypt(m.body_enc) }));
+    const push_devices = await db.all('SELECT device, created_at, last_success_at FROM push_subscriptions WHERE person_id = ? ORDER BY created_at', [p.id]);
     await audit(db, { actor_id: p.id, action: 'person.exported', ip: req.ip });
     return {
       status: 200,
       headers: { 'content-disposition': 'attachment; filename="data-saya-kolab-hub.json"' },
-      body: { exported_at: nowIso(), person: { name: p.name, phone: crypto.decrypt(p.phone_enc), consent_at: p.consent_at, consent_version: p.consent_version }, memberships, events, wa_messages: messages },
+      body: { exported_at: nowIso(), person: { name: p.name, phone: crypto.decrypt(p.phone_enc), consent_at: p.consent_at, consent_version: p.consent_version, digest_channel: p.digest_channel }, memberships, events, wa_messages: messages, push_devices },
     };
   });
 
@@ -464,6 +528,7 @@ export function registerRoutes(router, ctx) {
       await t.run("UPDATE people SET name = 'Mantan anggota', phone_enc = NULL, phone_hash = NULL, erased_at = ? WHERE id = ?", [ts, p.id]);
       await t.run('UPDATE memberships SET removed_at = ? WHERE person_id = ? AND removed_at IS NULL', [ts, p.id]);
       await t.run('DELETE FROM sessions WHERE person_id = ?', [p.id]);
+      await ctx.push.removeAll(t, p.id);
       await audit(t, { actor_id: p.id, action: 'person.erased', ip: req.ip });
     });
     return { status: 200, headers: { 'set-cookie': auth.cookieHeader('', 0) }, body: { ok: true } };
@@ -477,6 +542,9 @@ export function registerRoutes(router, ctx) {
     await audit(db, { workspace_id: id, actor_id: p.id, action: 'retention.manual_run', detail: r, ip: req.ip });
     return r;
   });
+
+  // ---------- Dasbor beban kerja dan ekspor (Fase 2) ----------
+  registerReports(router, ctx, { need });
 
   // ---------- Simulasi WA (hanya WA_MODE=simulate) ----------
   if (cfg.wa.mode === 'simulate') {
