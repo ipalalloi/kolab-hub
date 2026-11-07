@@ -1,5 +1,5 @@
 // Service worker dasar: cangkang aplikasi tersedia luring; API selalu ke jaringan dulu.
-const VERSION = 'kolab-v1';
+const VERSION = 'kolab-v2';
 const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/icon.svg', '/manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {

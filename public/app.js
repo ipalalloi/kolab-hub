@@ -179,9 +179,50 @@ function cardTile(c, { draggable = false } = {}) {
   return el;
 }
 
+// Sama dengan parsePercent di server: isian kosong atau bukan angka tidak pernah menjadi 0%.
+function parsePercent(v) {
+  const t = String(v ?? '').trim().replace(/%$/, '').trim();
+  if (!/^\d{1,3}$/.test(t)) return null;
+  const n = Number(t);
+  return n <= 100 ? n : null;
+}
+
+/** Tanya persentase sampai sah atau dibatalkan. Mengembalikan null bila dibatalkan. */
+function askPercent() {
+  let msg = 'Progres berapa persen? (angka bulat 0–100)';
+  for (;;) {
+    const raw = prompt(msg);
+    if (raw === null) return null;
+    const n = parsePercent(raw);
+    if (n !== null) return n;
+    msg = raw.trim() ? `"${raw.trim()}" bukan angka 0–100. Progres berapa persen?` : 'Isian kosong. Progres berapa persen? (angka bulat 0–100)';
+  }
+}
+
+// Tombol tindakan kartu. Server mengirim `card.actions` sesuai status kartu dan peran peminta.
+const ACTION_UI = {
+  mulai: { icon: '▶', label: (c) => (c.column_key === 'tertahan' ? 'Lanjutkan' : 'Mulai') },
+  progres: { icon: '📈', label: () => 'Lapor progres', short: 'Lapor' },
+  selesai: { icon: '✅', label: () => 'Selesai' },
+  tahan: { icon: '⏸', label: () => 'Tahan' },
+  bantuan: { icon: '🆘', label: () => 'Minta bantuan', short: 'Bantuan' },
+  setujui: { icon: '👍', label: () => 'Setujui', primary: true },
+  revisi: { icon: '↩', label: () => 'Minta revisi' },
+  cek: { icon: '✔', label: () => 'Tandai sudah dicek' },
+};
+
+function actionButtons(c, { compact = false } = {}) {
+  return (c.actions || []).filter((a) => ACTION_UI[a]).map((a) => {
+    const ui = ACTION_UI[a];
+    const label = compact && ui.short ? ui.short : ui.label(c);
+    return h('button', { class: `btn${ui.primary ? ' primary' : ''}`, 'data-action': a, onclick: run(async () => { await quick(c.code, a); state.rerender(); }) },
+      compact ? h('b', {}, ui.icon) : null, label);
+  });
+}
+
 async function quick(code, action) {
   const args = { action };
-  if (action === 'progres') { const p = prompt('Progres berapa persen? (0–100)'); if (p === null) return; args.percent = Number(p); args.note = prompt('Catatan singkat (opsional)') || ''; }
+  if (action === 'progres') { const p = askPercent(); if (p === null) return; args.percent = p; args.note = prompt('Catatan singkat (opsional)') || ''; }
   if (action === 'selesai') args.note = prompt('Catatan hasil (opsional)') || '';
   if (action === 'bantuan') { const n = prompt('Bantuan apa yang dibutuhkan?'); if (n === null) return; args.note = n; }
   if (action === 'tahan') { const r = prompt('Alasan menahan kartu?'); if (!r) return; args.reason = r; }
@@ -197,11 +238,7 @@ async function viewMyTasks(main) {
   if (!tasks.length) { main.append(h('p', { class: 'panel' }, 'Tidak ada tugas aktif. 👍')); return; }
   for (const c of tasks) {
     const box = h('div', { class: 'panel', style: 'margin-bottom:12px' }, cardTile(c),
-      h('div', { class: 'shortcuts' },
-        h('button', { class: 'btn', onclick: run(async () => { await quick(c.code, c.column_key === 'tertahan' ? 'mulai' : 'mulai'); state.rerender(); }), disabled: c.column_key === 'dikerjakan' || c.column_key === 'ditinjau' }, h('b', {}, '▶'), 'Mulai'),
-        h('button', { class: 'btn', onclick: run(async () => { await quick(c.code, 'progres'); state.rerender(); }), disabled: c.column_key === 'ditinjau' }, h('b', {}, '📈'), 'Lapor'),
-        h('button', { class: 'btn', onclick: run(async () => { await quick(c.code, 'selesai'); state.rerender(); }), disabled: c.column_key === 'ditinjau' }, h('b', {}, '✅'), 'Selesai'),
-        h('button', { class: 'btn', onclick: run(async () => { await quick(c.code, 'bantuan'); state.rerender(); }) }, h('b', {}, '🆘'), 'Bantuan')));
+      h('div', { class: 'shortcuts' }, actionButtons(c, { compact: true })));
     main.append(box);
   }
 }
@@ -320,15 +357,8 @@ async function viewCard(main, code) {
       c.description ? h('p', {}, c.description) : null,
       h('div', { class: 'meta' }, h('span', { class: 'tag' }, COL_NAME[c.column_key]), c.assignee ? h('span', {}, `👤 ${c.assignee.name}`) : null, c.due_date ? h('span', {}, `Tenggat ${c.due_date}`) : null, h('span', {}, `Prioritas ${c.priority}`), c.needs_review ? h('span', { class: 'tag review' }, 'perlu dicek') : null),
       h('div', { class: 'progress' }, h('span', { style: `width:${c.progress}%` })),
-      h('div', { class: 'row' },
-        h('button', { class: 'btn', onclick: run(async () => { await quick(code, 'mulai'); state.rerender(); }) }, 'Mulai'),
-        h('button', { class: 'btn', onclick: run(async () => { await quick(code, 'progres'); state.rerender(); }) }, 'Lapor progres'),
-        h('button', { class: 'btn', onclick: run(async () => { await quick(code, 'selesai'); state.rerender(); }) }, 'Selesai'),
-        h('button', { class: 'btn', onclick: run(async () => { await quick(code, 'tahan'); state.rerender(); }) }, 'Tahan'),
-        mgr && c.column_key === 'ditinjau' ? h('button', { class: 'btn primary', onclick: run(async () => { await quick(code, 'setujui'); state.rerender(); }) }, 'Setujui') : null,
-        mgr && c.column_key === 'ditinjau' ? h('button', { class: 'btn', onclick: run(async () => { await quick(code, 'revisi'); state.rerender(); }) }, 'Minta revisi') : null,
-        mgr && c.needs_review ? h('button', { class: 'btn', onclick: run(async () => { await quick(code, 'cek'); state.rerender(); }) }, 'Tandai sudah dicek') : null),
-      (() => {
+      (() => { const btns = actionButtons(c); return btns.length ? h('div', { class: 'row' }, btns) : h('p', { class: 'muted' }, my_role === 'viewer' ? 'Anda pemantau: hanya dapat melihat.' : 'Tidak ada tindakan untuk Anda pada kartu ini.'); })(),
+      (c.actions || []).includes('komentar') && (() => {
         const f = h('form', { class: 'row' }, h('input', { name: 'text', placeholder: 'Tulis komentar…', class: 'grow' }), h('button', { class: 'btn' }, 'Kirim'));
         f.addEventListener('submit', run(async () => { await api('POST', `/api/cards/${code}/actions`, { action: 'komentar', text: f.text.value }); state.rerender(); }));
         return f;

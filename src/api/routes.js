@@ -2,7 +2,7 @@
 import { HttpError, newId, nowIso, parseJson, maskPhone, normalizePhone } from '../lib/util.js';
 import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { readJson } from '../http/http.js';
-import { performCardAction, revertEvent, requireRole, getCardByCode, getMembership, MANAGER_ROLES } from '../domain/actions.js';
+import { performCardAction, revertEvent, requireRole, getCardByCode, getMembership, allowedActions, MANAGER_ROLES } from '../domain/actions.js';
 import { createCard, audit, defaultColumns, rowToEvent, appendWorkspaceEvent } from '../domain/store.js';
 import { runRetention } from '../jobs/retention.js';
 
@@ -14,6 +14,20 @@ export const DEFAULT_TRANSFERS = [
   { purpose: 'Pengiriman dan penerimaan pesan WhatsApp', country: 'Amerika Serikat / lokasi server Meta', recipient: 'Meta Platforms (WhatsApp Cloud API)', data_categories: 'Nomor WA, isi pesan, lampiran', instrument: 'Ketentuan pemrosesan data WhatsApp Business' },
   { purpose: 'Onboarding dan penerusan webhook WhatsApp', country: 'Sesuai lokasi BSP', recipient: 'BSP lokal', data_categories: 'Nomor WA, isi pesan, metadata', instrument: 'Perjanjian pemrosesan data dengan BSP' },
 ];
+
+/** Tanggal tinjau bawaan register transfer: satu tahun dari `from` (YYYY-MM-DD). */
+export function defaultReviewDate(from = new Date()) {
+  return new Date(from.getTime() + 365 * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** Isi register transfer bawaan untuk workspace baru. Dipakai API dan `npm run create-owner`. */
+export async function insertDefaultTransfers(t, workspaceId, ts = nowIso()) {
+  const review = defaultReviewDate(new Date(ts));
+  for (const x of DEFAULT_TRANSFERS) {
+    await t.run('INSERT INTO data_transfers (id, workspace_id, purpose, country, recipient, data_categories, instrument, next_review, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [newId(), workspaceId, x.purpose, x.country, x.recipient, x.data_categories, x.instrument, review, ts]);
+  }
+}
 
 export function registerRoutes(router, ctx) {
   const { db, crypto, cfg, auth, outbound } = ctx;
@@ -35,13 +49,15 @@ export function registerRoutes(router, ctx) {
     });
   }
 
-  async function cardView(t, card) {
+  // `me` = baris membership peminta; bila ada, kartu membawa daftar tombol yang boleh ditampilkan.
+  async function cardView(t, card, me) {
     const assignee = card.assignee_id ? await t.get('SELECT id, name, erased_at FROM people WHERE id = ?', [card.assignee_id]) : null;
     return {
       id: card.id, code: card.code, board_id: card.board_id, workspace_id: card.workspace_id, title: card.title,
       description: card.description, assignee: personView(assignee), due_date: card.due_date, priority: card.priority,
       column_key: card.column_key, progress: Number(card.progress), hold_reason: card.hold_reason,
       needs_review: !!Number(card.needs_review), updated_at: card.updated_at,
+      ...(me ? { actions: allowedActions(card, me, me.person_id) } : {}),
     };
   }
 
@@ -152,10 +168,7 @@ export function registerRoutes(router, ctx) {
     await db.tx(async (t) => {
       await t.run('INSERT INTO workspaces (id, name, retention_days, created_at) VALUES (?, ?, ?, ?)', [id, name.slice(0, 100), cfg.retention.defaultDays, nowIso()]);
       await t.run('INSERT INTO memberships (workspace_id, person_id, role, wip_limit, created_at) VALUES (?, ?, ?, ?, ?)', [id, p.id, 'owner', cfg.defaultWipLimit, nowIso()]);
-      for (const x of DEFAULT_TRANSFERS) {
-        await t.run('INSERT INTO data_transfers (id, workspace_id, purpose, country, recipient, data_categories, instrument, next_review, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [newId(), id, x.purpose, x.country, x.recipient, x.data_categories, x.instrument, new Date(Date.now() + 365 * 86_400_000).toISOString().slice(0, 10), nowIso()]);
-      }
+      await insertDefaultTransfers(t, id);
       await audit(t, { workspace_id: id, actor_id: p.id, action: 'workspace.created', detail: { name }, ip: req.ip });
     });
     return { id };
@@ -246,9 +259,11 @@ export function registerRoutes(router, ctx) {
     await requireRole(db, id, p.id, ['owner']);
     const b = await readJson(req);
     for (const k of ['purpose', 'country', 'recipient', 'data_categories', 'instrument']) if (!String(b[k] || '').trim()) throw new HttpError(400, `${k} wajib diisi`);
+    const review = b.next_review ? String(b.next_review).trim() : defaultReviewDate();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(review) || Number.isNaN(Date.parse(review))) throw new HttpError(400, 'Tanggal tinjau harus berformat YYYY-MM-DD');
     const tid = newId();
     await db.run('INSERT INTO data_transfers (id, workspace_id, purpose, country, recipient, data_categories, instrument, next_review, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [tid, id, b.purpose, b.country, b.recipient, b.data_categories, b.instrument, b.next_review || null, nowIso()]);
+      [tid, id, b.purpose, b.country, b.recipient, b.data_categories, b.instrument, review, nowIso()]);
     await audit(db, { workspace_id: id, actor_id: p.id, action: 'transfer.registered', target: tid, detail: b, ip: req.ip });
     return { id: tid };
   });
@@ -288,7 +303,7 @@ export function registerRoutes(router, ctx) {
     const me = await requireRole(db, board.workspace_id, p.id);
     const cards = await db.all('SELECT * FROM cards WHERE board_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC', [id]);
     const views = [];
-    for (const c of cards) views.push(await cardView(db, c));
+    for (const c of cards) views.push(await cardView(db, c, me));
     return { board: { id: board.id, name: board.name, prefix: board.prefix, workspace_id: board.workspace_id, columns: parseJson(board.columns, defaultColumns()) }, cards: views, my_role: me.role };
   });
 
@@ -296,7 +311,7 @@ export function registerRoutes(router, ctx) {
     const p = need(req);
     const board = await db.get('SELECT * FROM boards WHERE id = ? AND closed_at IS NULL', [id]);
     if (!board) throw new HttpError(404, 'Proyek tidak ditemukan');
-    await requireRole(db, board.workspace_id, p.id, ['owner', 'coordinator']);
+    const me = await requireRole(db, board.workspace_id, p.id, ['owner', 'coordinator']);
     const b = await readJson(req);
     if (b.assignee_id) {
       const am = await getMembership(db, board.workspace_id, b.assignee_id);
@@ -307,7 +322,7 @@ export function registerRoutes(router, ctx) {
       await notifyAssignment(t, card, b.assignee_id);
       return card;
     });
-    return cardView(db, await db.get('SELECT * FROM cards WHERE id = ?', [card.id]));
+    return cardView(db, await db.get('SELECT * FROM cards WHERE id = ?', [card.id]), me);
   });
 
   router.get('/api/cards/:code', async (req, { code }) => {
@@ -318,7 +333,7 @@ export function registerRoutes(router, ctx) {
     const evs = (await db.all('SELECT e.*, p.name AS actor_name, p.erased_at AS actor_erased FROM events e LEFT JOIN people p ON p.id = e.actor_id WHERE e.card_id = ? ORDER BY e.seq', [card.id])).map(rowToEvent);
     const reverted = new Set(evs.filter((e) => e.type === 'event.reverted').map((e) => e.payload.target_seq));
     return {
-      card: await cardView(db, card), my_role: me.role,
+      card: await cardView(db, card, me), my_role: me.role,
       events: evs.map((e) => ({ seq: e.seq, type: e.type, source: e.source, actor: e.actor_id ? (e.actor_erased ? 'Mantan anggota' : e.actor_name) : 'Sistem', payload: e.payload, created_at: e.created_at, reverted: reverted.has(e.seq) })),
     };
   });
@@ -328,13 +343,14 @@ export function registerRoutes(router, ctx) {
     const b = await readJson(req);
     const card = await getCardByCode(db, code);
     if (!card) throw new HttpError(404, 'Kartu tidak ditemukan');
-    await db.tx(async (t) => {
+    const me = await db.tx(async (t) => {
       const fresh = await t.get('SELECT * FROM cards WHERE id = ?', [card.id]);
       const { action, ...args } = b;
       await performCardAction(t, { card: fresh, actor: { person_id: p.id }, action, args, source: client(req) });
       if (action === 'tugaskan' && args.assignee_id && args.assignee_id !== fresh.assignee_id) await notifyAssignment(t, fresh, args.assignee_id);
+      return getMembership(t, fresh.workspace_id, p.id);
     });
-    return cardView(db, await db.get('SELECT * FROM cards WHERE id = ?', [card.id]));
+    return cardView(db, await db.get('SELECT * FROM cards WHERE id = ?', [card.id]), me);
   });
 
   router.post('/api/events/:seq/revert', async (req, { seq }) => {
@@ -347,11 +363,11 @@ export function registerRoutes(router, ctx) {
   router.get('/api/my/tasks', async (req) => {
     const p = need(req);
     const rows = await db.all(
-      `SELECT c.* FROM cards c JOIN memberships m ON m.workspace_id = c.workspace_id AND m.person_id = ? AND m.removed_at IS NULL
+      `SELECT c.*, m.role AS my_role FROM cards c JOIN memberships m ON m.workspace_id = c.workspace_id AND m.person_id = ? AND m.removed_at IS NULL
        WHERE c.assignee_id = ? AND c.deleted_at IS NULL AND c.column_key <> 'selesai'
        ORDER BY CASE WHEN c.due_date IS NULL THEN 1 ELSE 0 END, c.due_date, c.code`, [p.id, p.id]);
     const out = [];
-    for (const r of rows) out.push(await cardView(db, r));
+    for (const r of rows) out.push(await cardView(db, r, { role: r.my_role, person_id: p.id }));
     return out;
   });
 
