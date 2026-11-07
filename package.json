@@ -1,0 +1,23 @@
+{
+  "name": "kolab-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kolaborasi web + PWA + WhatsApp: kanban per instruksi dengan event log tunggal",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node --no-warnings=ExperimentalWarning src/server.js",
+    "worker": "node --no-warnings=ExperimentalWarning src/jobs/run-worker.js",
+    "migrate": "node --no-warnings=ExperimentalWarning src/db/migrate.js",
+    "seed": "node --no-warnings=ExperimentalWarning scripts/seed.js",
+    "create-owner": "node --no-warnings=ExperimentalWarning scripts/create-owner.js",
+    "gen-keys": "node scripts/gen-keys.js",
+    "test": "node --no-warnings=ExperimentalWarning --test test/*.test.js"
+  },
+  "optionalDependencies": {
+    "pg": "^8.13.0"
+  },
+  "license": "UNLICENSED"
+}
